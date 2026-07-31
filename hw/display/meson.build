@@ -72,13 +72,49 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
   # Sources live in the parent repo, two directories above this vendored submodule.
   reims_vgpu_repo_dir = meson.global_source_root() / '..' / '..'
   reims_vgpu_abi_header_dir = reims_vgpu_repo_dir / 'crates' / 'reims-vgpu' / 'include'
-  reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
-    'printf %s "${REIMS_VGPU_BACKEND:-metal}"', check: true).stdout().strip()
-  cargo = find_program('cargo')
-  # Rust staticlib always needs these on Unix; Apple frameworks only on Darwin.
-  reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+  # The default follows the host, matching scripts/qemu-build/qemu-build.sh.
+  # A fixed 'metal' default was only ever right on Apple: backend-metal off macOS
+  # is a compile_error! in crates/reims-vgpu/src/lib.rs, so a bare `ninja` with no
+  # REIMS_VGPU_BACKEND in the environment failed inside rustc, naming the feature
+  # rather than the missing setting.
   if host_os == 'darwin'
-    reims_vgpu_rust_sys_libs += ['-liconv']
+    reims_vgpu_backend_default = 'metal'
+  else
+    reims_vgpu_backend_default = 'vulkan'
+  endif
+  reims_vgpu_backend_kind = run_command(find_program('sh'), '-c',
+    'printf %s "${REIMS_VGPU_BACKEND:-' + reims_vgpu_backend_default + '}"',
+    check: true).stdout().strip()
+  cargo = find_program('cargo')
+  if host_os == 'windows'
+    # MinGW has no libdl, so the Unix list is not a starting point here.
+    #
+    # These are the Win32 import libraries the Rust standard library and the
+    # windows-sys crates in the dependency graph reference; gcc's own specs
+    # already supply the CRT pieces (mingw32 / msvcrt / mingwex / gcc_eh), so
+    # only the OS imports belong in this list.
+    #
+    # Deliberately a superset: an import library nothing references contributes
+    # no symbols to the link, whereas a missing one is an undefined symbol at
+    # final link of the whole emulator. The authoritative list for a given
+    # toolchain comes from
+    #   cargo rustc -p reims-vgpu --release <features> -- --print native-static-libs
+    # and must be reconciled against this on the first successful build rather
+    # than extended by guesswork.
+    reims_vgpu_rust_sys_libs = [
+      '-lkernel32', '-ladvapi32', '-lntdll', '-luserenv', '-lws2_32',
+      '-lbcrypt', '-ldbghelp', '-lsynchronization',
+      # winit's Win32 backend and the raw-window-handle surface path.
+      '-lole32', '-loleaut32', '-luser32', '-lgdi32', '-lshell32', '-lshcore',
+      '-ldwmapi', '-limm32', '-luxtheme',
+      '-lpthread', '-lm',
+    ]
+  else
+    # Rust staticlib always needs these on Unix; Apple frameworks only on Darwin.
+    reims_vgpu_rust_sys_libs = ['-lm', '-ldl', '-lpthread']
+    if host_os == 'darwin'
+      reims_vgpu_rust_sys_libs += ['-liconv']
+    endif
   endif
   if reims_vgpu_backend_kind == 'metal'
     reims_vgpu_cargo_features = '--features backend-metal'
@@ -118,7 +154,10 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
         '-lobjc',
       ] + reims_vgpu_rust_sys_libs
     else
-      # Linux window backends are loaded by winit/ash-window at runtime.
+      # Linux window backends are loaded by winit/ash-window at runtime. Windows
+      # needs no runtime loading either — its Win32 imports are already in
+      # reims_vgpu_rust_sys_libs, because unlike X11/Wayland there is no second
+      # backend to choose between.
       reims_vgpu_link_args = reims_vgpu_rust_sys_libs
     endif
   else
