@@ -35,10 +35,12 @@
 #include "hw/core/qdev-properties.h"
 #include "ui/console.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "hw/acpi/acpi_aml_interface.h"
+#include "system/runstate.h"
 
 /* #define DEBUG_SMC */
 
@@ -126,6 +128,16 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     smc_debug("CMD received: 0x%02x\n", (uint8_t)val);
     switch (val) {
     case APPLESMC_READ_CMD:
+    /*
+     * The write command was declared but never accepted here, so every write
+     * fell through to `default` and was answered with BAD_CMD. That is what a
+     * guest sees as kSMCBadCommand, and macOS hits it on the path it uses to
+     * restart the machine: AppleSMC's halt/restart action arms the SMC
+     * watchdog, SMCWDT::setWatchdogTimer gets BAD_CMD back, and the reboot
+     * never happens -- the guest unmounts its volumes, says MACH Reboot, and
+     * then waits forever for hardware that refused the request.
+     */
+    case APPLESMC_WRITE_CMD:
         /* did last command run through OK? */
         if (status == APPLESMC_ST_CMD_DONE || status == APPLESMC_ST_NEW_CMD) {
             s->cmd = val;
@@ -157,6 +169,36 @@ static const struct AppleSMCData *applesmc_find_key(AppleSMCState *s)
     return NULL;
 }
 
+/*
+ * A write completed. Report it and do nothing else.
+ *
+ * Accepting the write is the whole fix for kSMCBadCommand; acting on one is a
+ * separate question with a separate answer. Which key macOS writes to arm the
+ * restart watchdog is not something to name from memory -- a wrong constant
+ * here would reset the VM on an unrelated write, which is worse than not
+ * resetting at all. So every write is logged with its key and payload, and the
+ * key that arms the watchdog is to be read off a boot log before anything is
+ * wired to it.
+ *
+ * LOG_UNIMP is the honest category: the request is understood and answered,
+ * and its effect is not implemented. It reaches the file named by `-D`, which
+ * is where a Windows host can see it at all.
+ */
+static void applesmc_key_written(AppleSMCState *s)
+{
+    g_autoptr(GString) payload = g_string_new(NULL);
+    int i;
+
+    for (i = 0; i < s->data_len; i++) {
+        g_string_append_printf(payload, "%02x", s->data[i]);
+    }
+    qemu_log_mask(LOG_UNIMP,
+                  "applesmc: write '%c%c%c%c' len=%u data=%s "
+                  "accepted; no effect is implemented\n",
+                  s->key[0], s->key[1], s->key[2], s->key[3],
+                  s->data_len, s->data_len ? payload->str : "-");
+}
+
 static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                                    unsigned size)
 {
@@ -185,6 +227,53 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                           s->key[0], s->key[1], s->key[2], s->key[3]);
                 s->status = APPLESMC_ST_CMD_DONE;
                 s->status_1e = APPLESMC_ST_1E_NOEXIST;
+            }
+        }
+        s->read_pos++;
+        break;
+    case APPLESMC_WRITE_CMD:
+        /*
+         * Same framing as a read, with a payload after it: four key bytes, a
+         * length byte, then that many data bytes.
+         *
+         * The value is accepted and not stored. The key table is the device's
+         * static description of itself -- an -osk string and a handful of fan
+         * and temperature constants -- and letting a guest edit it would make
+         * the machine's identity depend on what the guest last wrote. What the
+         * guest needs from a write is an answer, not a memory.
+         */
+        if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
+            break;
+        }
+        if (s->read_pos < 4) {
+            s->key[s->read_pos] = val;
+            s->status = APPLESMC_ST_ACK;
+        } else if (s->read_pos == 4) {
+            if (applesmc_find_key(s) == NULL) {
+                smc_debug("WRITE_CMD: key '%c%c%c%c' not found!\n",
+                          s->key[0], s->key[1], s->key[2], s->key[3]);
+                s->status = APPLESMC_ST_CMD_DONE;
+                s->status_1e = APPLESMC_ST_1E_NOEXIST;
+                break;
+            }
+            /* Bounded by the data buffer, not by what the guest claims. */
+            s->data_len = MIN(val, sizeof(s->data));
+            s->data_pos = 0;
+            s->status = APPLESMC_ST_ACK;
+            s->status_1e = APPLESMC_ST_CMD_DONE;  /* clear on valid key */
+            if (s->data_len == 0) {
+                applesmc_key_written(s);
+                s->status = APPLESMC_ST_CMD_DONE;
+            }
+        } else {
+            if (s->data_pos < s->data_len) {
+                s->data[s->data_pos++] = val;
+            }
+            if (s->data_pos == s->data_len) {
+                applesmc_key_written(s);
+                s->status = APPLESMC_ST_CMD_DONE;
+            } else {
+                s->status = APPLESMC_ST_ACK;
             }
         }
         s->read_pos++;

@@ -28,6 +28,7 @@
 #include "hw/i386/x86.h"
 #include "hw/i386/apic_internal.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qapi/error.h"
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-visit-common.h"
@@ -2675,6 +2676,24 @@ int whpx_vcpu_run(CPUState *cpu)
             error_report("WHPX: Unexpected VP exit code %d",
                          vcpu->exit_ctx.ExitReason);
             whpx_get_registers(cpu, WHPX_LEVEL_FULL_STATE);
+            /*
+             * Also to the log file, because error_report writes to stderr and a
+             * Windows build with a UI backend is a GUI-subsystem binary with no
+             * console attached: on the one host this accelerator runs on, the
+             * only account of why the VM stopped went nowhere. A guest that
+             * halts with `info status` saying `paused` and nothing else said is
+             * indistinguishable from a hang, which is how this exit was read
+             * for an entire bring-up.
+             *
+             * CPU index and RIP are included because the reason alone does not
+             * say which processor died or where.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "whpx: cpu %d stopped the VM: unexpected exit "
+                          "reason %d at cs:rip %04x:%016" PRIx64 "\n",
+                          cpu->cpu_index, vcpu->exit_ctx.ExitReason,
+                          vcpu->exit_ctx.VpContext.Cs.Selector,
+                          (uint64_t)vcpu->exit_ctx.VpContext.Rip);
             bql_lock();
             vm_stop(RUN_STATE_PAUSED);
             bql_unlock();
