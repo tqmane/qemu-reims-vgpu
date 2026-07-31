@@ -96,11 +96,22 @@ if config_all_devices.has_key('CONFIG_REIMS_VGPU')
     #
     # Deliberately a superset: an import library nothing references contributes
     # no symbols to the link, whereas a missing one is an undefined symbol at
-    # final link of the whole emulator. The authoritative list for a given
-    # toolchain comes from
-    #   cargo rustc -p reims-vgpu --release <features> -- --print native-static-libs
-    # and must be reconciled against this on the first successful build rather
-    # than extended by guesswork.
+    # final link of the whole emulator.
+    #
+    # Reconciled against the authoritative list on the first build that linked,
+    # which reports what rustc would pass:
+    #   cargo rustc -p reims-vgpu <features> -- --print native-static-libs
+    #     -> -lwindows.0.52.0 -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp
+    # Everything past that first entry is already below. `windows.0.52.0` is
+    # deliberately absent and must stay absent: it is not a system library but an
+    # import library the windows_x86_64_gnu crate ships, reachable only through a
+    # -L that rustc adds and meson does not have. It needs no entry because the
+    # staticlib already carries its members — `ar t libreims_vgpu.a` lists them —
+    # so naming it here would only make the link depend on a cargo registry path.
+    #
+    # Re-run the command above when the dependency graph changes; a name that
+    # appears there and is neither below nor bundled is the next undefined
+    # symbol.
     reims_vgpu_rust_sys_libs = [
       '-lkernel32', '-ladvapi32', '-lntdll', '-luserenv', '-lws2_32',
       '-lbcrypt', '-ldbghelp', '-lsynchronization',

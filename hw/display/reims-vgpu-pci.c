@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -529,8 +530,39 @@ static uint64_t reims_vgpu_pci_bar1_fingerprint(ReimsVGPUPCIState *s, uint32_t *
 }
 
 /*
+ * Where the GOP console proxy writes, resolved once through the crate so the
+ * shim's artifact lands beside the crate's own sinks on every host. The shim
+ * must not name the directory itself: `/tmp` is a path only on the Unix rails,
+ * and on Windows it is drive-relative, so fopen would fail and this always-on
+ * log would go silent with nothing to say so.
+ *
+ * Resolution is cached because the proxy runs on a 250 ms heartbeat, and it is
+ * attempted only once: if the crate cannot answer, it will not answer later
+ * either, and retrying every tick would trade one quiet log for a busy one.
+ * Returns NULL when the path is unavailable, which the caller reports.
+ */
+static const char *reims_vgpu_pci_gop_console_path(void)
+{
+    static char path[PATH_MAX];
+    static bool resolved;
+    static bool ok;
+
+    if (!resolved) {
+        resolved = true;
+        ok = reims_vgpu_qemu_log_path("reims-vgpu-gop-console.log",
+                                      path, sizeof(path)) == REIMS_VGPU_QEMU_OK;
+        if (!ok) {
+            warn_report("reims-vgpu: cannot resolve GOP console proxy log path; "
+                        "GOPCON records disabled for this run");
+        }
+    }
+    return ok ? path : NULL;
+}
+
+/*
  * Always-on GOP console ownership proxy.
- * Path: /tmp/reims-vgpu-gop-console.log
+ * Path: reims-vgpu-gop-console.log under the crate's log dir
+ * (REIMS_VGPU_LOG_DIR, else /tmp on Unix rails / OS temp on Windows).
  * Grep: GOPCON
  *
  * Freeze class under test: host console stops tracking guest early-boot log
@@ -548,6 +580,7 @@ static void reims_vgpu_pci_gop_console_proxy(ReimsVGPUPCIState *s, bool use_bar1
     uint64_t bar1_fp = reims_vgpu_pci_bar1_fingerprint(s, &rgb_nz);
     bool bar1_changed;
     bool force;
+    const char *path;
     FILE *f;
 
     s->gop_proxy_ticks++;
@@ -570,7 +603,8 @@ static void reims_vgpu_pci_gop_console_proxy(ReimsVGPUPCIState *s, bool use_bar1
         return;
     }
 
-    f = fopen("/tmp/reims-vgpu-gop-console.log", "a");
+    path = reims_vgpu_pci_gop_console_path();
+    f = path ? fopen(path, "a") : NULL;
     if (f) {
         fprintf(f,
                 "GOPCON mono_ns=%" PRIu64
