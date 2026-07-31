@@ -3026,7 +3026,24 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    /*
+     * Leaves listed here are exited to QEMU; every other leaf is answered by
+     * the hypervisor from the *host* CPU, which is only harmless while the
+     * guest does not read topology out of one.
+     *
+     * 0x2, 0x4 and 0x5 are here because a guest does. XNU's
+     * osfmk/i386/cpuid.c takes cores-per-package straight from leaf 4 and never
+     * consults -smp, so on a host whose leaf 4 describes something else -- any
+     * hybrid P/E-core part, where it describes neither the guest's topology nor
+     * a uniform one -- the guest computes a topology that does not exist.
+     * Measured on such a host: macOS hangs in early SMP bring-up with -smp 8,
+     * producing no console output at all, and boots to its installer with
+     * -smp 1. QEMU answers all three itself (target/i386/cpu.c), and its leaf 4
+     * builds the core-count bits from the machine's own topo_info, so exiting
+     * them is what makes -smp mean something to the guest.
+     */
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x2, 0x4, 0x5, 0x6, 0x7, 0xb, 0xd,
+        0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
