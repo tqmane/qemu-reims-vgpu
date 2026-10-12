@@ -21,6 +21,7 @@
 #include "system/cpus.h"
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
+#include "qemu/lockable.h"
 #include "qemu/memalign.h"
 #include "hw/core/boards.h"
 #include "hw/intc/ioapic.h"
@@ -55,6 +56,10 @@
 #define HV_X64_MSR_APIC_FREQUENCY       0x40000023
 #define HV_X64_MSR_VP_ASSIST_PAGE       0x40000073
 #define HV_X64_MSR_GUEST_IDLE           0x400000f0
+
+#ifndef WHV_E_INSUFFICIENT_BUFFER
+#define WHV_E_INSUFFICIENT_BUFFER ((HRESULT)0x80370301)
+#endif
 
 static bool is_modern_os = true;
 
@@ -418,8 +423,9 @@ static int whpx_set_xsave_state(const CPUState *cpu)
     size_t xsavec_buf_len;
 
     /* allocate and populate compacted buffer */
-    xsavec_buf_len = whpx_get_xsave_max_len();
+    xsavec_buf_len = MAX(whpx_get_xsave_max_len(), cpu->accel->xsave_state_size);
     xsavec_buf = qemu_memalign(page, xsavec_buf_len);
+    memset(xsavec_buf, 0, xsavec_buf_len);
 
     /* save registers to standard format buffer */
     x86_cpu_xsave_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
@@ -447,6 +453,40 @@ static int whpx_set_xsave_state(const CPUState *cpu)
     }
 
     return 0;
+}
+
+static bool whpx_reset_vcpu_state(CPUState *cpu)
+{
+    static const WHV_REGISTER_NAME names[] = {
+        WHvRegisterPendingInterruption,
+        WHvRegisterPendingEvent,
+        WHvRegisterInterruptState,
+        WHvX64RegisterDeliverabilityNotifications,
+        WHvRegisterInternalActivityState,
+    };
+    WHV_REGISTER_VALUE values[ARRAY_SIZE(names)] = {0};
+    HRESULT hr;
+    AccelCPUState *vcpu = cpu->accel;
+
+    /* Reset APs must wait for INIT/SIPI when the kernel APIC owns startup. */
+    values[ARRAY_SIZE(names) - 1].InternalActivity.StartupSuspend =
+        whpx_irqchip_in_kernel() && cpu->halted;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names, ARRAY_SIZE(names), values);
+
+    if (FAILED(hr)) {
+        error_report("WHPX: failed to reset cpu%u pending state, hr=%08lx",
+                     cpu->cpu_index, hr);
+        return false;
+    }
+    vcpu->window_registered = false;
+    vcpu->window_priority = 0;
+    vcpu->interruptable = false;
+    vcpu->ready_for_pic_interrupt = false;
+    vcpu->interruption_pending = false;
+    vcpu->xsave_state_stale = false;
+    memset(&vcpu->exit_ctx, 0, sizeof(vcpu->exit_ctx));
+    return true;
 }
 
 static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
@@ -527,6 +567,12 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
     int v86, r86;
 
     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
+
+    if (level == WHPX_LEVEL_RESET_STATE && !whpx_reset_vcpu_state(cpu)) {
+        BQL_LOCK_GUARD();
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return;
+    }
 
     /*
      * Following MSRs have side effects on the guest or are too heavy for
@@ -612,7 +658,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu) && !vcpu->xsave_state_stale) {
+        if ((level == WHPX_LEVEL_RESET_STATE && whpx_has_xsave()) ||
+            (whpx_is_xsave_enabled(cpu) && !vcpu->xsave_state_stale)) {
             whpx_set_xsave_state(cpu);
         }
         whpx_set_legacy_fp_registers(cpu, level);
@@ -818,32 +865,42 @@ static int whpx_get_xsave_state(CPUState *cpu)
     HRESULT hr;
     void *xsavec_buf;
     const size_t page = qemu_real_host_page_size();
-    size_t xsavec_buf_len = whpx_get_xsave_max_len();
+    size_t xsavec_buf_len = MAX(whpx_get_xsave_max_len(),
+                               cpu->accel->xsave_state_size);
     UINT32 bytes_written = 0;
 
-    xsavec_buf = qemu_memalign(page, xsavec_buf_len);
-    memset(xsavec_buf, 0, xsavec_buf_len);
-
-    if (!whpx_is_legacy_os()) {
-        hr = whp_dispatch.WHvGetVirtualProcessorState(
-            whpx->partition, cpu->cpu_index,
-            WHvVirtualProcessorStateTypeXsaveState,
-            xsavec_buf,
-            xsavec_buf_len, &bytes_written);
-    } else {
-        hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
-            whpx->partition, cpu->cpu_index,
-            xsavec_buf,
-            xsavec_buf_len, &bytes_written);
+    for (unsigned attempt = 0; ; attempt++) {
+        xsavec_buf = qemu_memalign(page, xsavec_buf_len);
+        memset(xsavec_buf, 0, xsavec_buf_len);
+        bytes_written = 0;
+        if (!whpx_is_legacy_os()) {
+            hr = whp_dispatch.WHvGetVirtualProcessorState(
+                whpx->partition, cpu->cpu_index,
+                WHvVirtualProcessorStateTypeXsaveState,
+                xsavec_buf, xsavec_buf_len, &bytes_written);
+        } else {
+            hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
+                whpx->partition, cpu->cpu_index,
+                xsavec_buf, xsavec_buf_len, &bytes_written);
+        }
+        if (attempt != 0 || hr != WHV_E_INSUFFICIENT_BUFFER ||
+            bytes_written <= xsavec_buf_len) {
+            break;
+        }
+        qemu_vfree(xsavec_buf);
+        xsavec_buf_len = bytes_written;
     }
-    if (FAILED(hr) || bytes_written == 0) {
+    if (FAILED(hr) || bytes_written < sizeof(X86LegacyXSaveArea) +
+                                     sizeof(X86XSaveHeader) ||
+        bytes_written > xsavec_buf_len) {
         qemu_vfree(xsavec_buf);
         cpu->accel->xsave_state_stale = true;
-        error_report("WHPX: failed to get xsave state, hr=%08lx", hr);
+        error_report("WHPX: failed to get xsave state, hr=%08lx "
+                     "buffer=%zu required=%u", hr, xsavec_buf_len, bytes_written);
         return -1;
     }
 
-    ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
+    ret = decompact_xsave_area(xsavec_buf, bytes_written, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
         cpu->accel->xsave_state_stale = true;
@@ -852,6 +909,7 @@ static int whpx_get_xsave_state(CPUState *cpu)
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
     cpu->accel->xsave_state_stale = false;
+    cpu->accel->xsave_state_size = xsavec_buf_len;
 
     return 0;
 }
