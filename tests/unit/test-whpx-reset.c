@@ -24,6 +24,9 @@ bool whpx_irqchip_in_kernel = true;
 static bool legacy, fail_read, fail_registers, short_read;
 static unsigned read_calls, sets, registers, errors;
 static UINT32 required_size = 4096;
+static uint64_t mtrr_cap;
+static bool fail_mtrr_query, fail_mtrr_write;
+static unsigned mtrr_writes;
 
 bool target_big_endian(void)
 {
@@ -144,13 +147,47 @@ static HRESULT WINAPI set_registers(WHV_PARTITION_HANDLE partition, UINT32 vp,
     if (fail_registers) {
         return E_FAIL;
     }
-    assert(count == ARRAY_SIZE(expected));
+    if (names[0] == WHvX64RegisterMsrMtrrDefType) {
+        unsigned idx = 0;
+        assert(names[idx++] == WHvX64RegisterMsrMtrrDefType);
+        if (mtrr_cap & MSR_MTRRcap_FIXRANGE_SUPPORT) {
+            for (unsigned i = 0; i < 11; i++) {
+                assert(names[idx++] == WHvX64RegisterMsrMtrrFix64k00000 + i);
+            }
+        }
+        for (unsigned i = 0; i < (mtrr_cap & 0xff); i++) {
+            assert(names[idx++] == WHvX64RegisterMsrMtrrPhysBase0 + i);
+            assert(names[idx++] == WHvX64RegisterMsrMtrrPhysMask0 + i);
+        }
+        assert(count == idx);
+        for (unsigned i = 0; i < count; i++) {
+            assert(values[i].Reg128.Low64 == 0 && values[i].Reg128.High64 == 0);
+        }
+        if (fail_mtrr_write) {
+            return E_FAIL;
+        }
+        mtrr_writes++;
+        return S_OK;
+    }
+    assert(count == ARRAY_SIZE(expected) - !whpx_irqchip_in_kernel);
     for (unsigned i = 0; i < count; i++) {
         assert(names[i] == expected[i]);
         assert(values[i].Reg128.Low64 ==
                (i == count - 1 && whpx_irqchip_in_kernel && vp != 0));
         assert(values[i].Reg128.High64 == 0);
     }
+    return S_OK;
+}
+
+static HRESULT WINAPI get_registers(WHV_PARTITION_HANDLE partition, UINT32 vp,
+                                    const WHV_REGISTER_NAME *names, UINT32 count,
+                                    WHV_REGISTER_VALUE *values)
+{
+    assert(count == 1 && names[0] == WHvX64RegisterMsrMtrrCap);
+    if (fail_mtrr_query) {
+        return E_FAIL;
+    }
+    values[0].Reg64 = mtrr_cap;
     return S_OK;
 }
 
@@ -167,6 +204,7 @@ int main(void)
     whp_dispatch.WHvSetVirtualProcessorState = set_modern;
     whp_dispatch.WHvSetVirtualProcessorXsaveState = set_legacy;
     whp_dispatch.WHvSetVirtualProcessorRegisters = set_registers;
+    whp_dispatch.WHvGetVirtualProcessorRegisters = get_registers;
 
     for (unsigned api = 0; api < 2; api++) {
         legacy = api;
@@ -240,5 +278,31 @@ int main(void)
                "and explicit failure paths\n", legacy ? "legacy" : "modern");
     }
     assert(sets == 16 && registers == 48 && errors == 48);
+    {
+        X86CPU cpu = {0};
+        AccelCPUState accel = {0};
+        CPUState *cs = &cpu.parent_obj;
+        const unsigned counts[] = {0, 8, 16};
+        cs->accel = &accel;
+        cpu.env.features[FEAT_1_EDX] = CPUID_MTRR;
+        for (unsigned fixed = 0; fixed < 2; fixed++) {
+            for (unsigned i = 0; i < ARRAY_SIZE(counts); i++) {
+                mtrr_cap = counts[i] | (fixed ? MSR_MTRRcap_FIXRANGE_SUPPORT : 0);
+                assert(whpx_reset_vcpu_state(cs));
+            }
+        }
+        assert(mtrr_writes == 6);
+        accel.interruption_pending = true;
+        fail_mtrr_query = true;
+        assert(!whpx_reset_vcpu_state(cs) && accel.interruption_pending);
+        fail_mtrr_query = false;
+        mtrr_cap = 17;
+        assert(!whpx_reset_vcpu_state(cs) && accel.interruption_pending);
+        mtrr_cap = 8;
+        fail_mtrr_write = true;
+        assert(!whpx_reset_vcpu_state(cs) && accel.interruption_pending);
+        assert(mtrr_writes == 6);
+        puts("PASS MTRR reset: fixed/variable ranges, 0/8/16 banks and failures");
+    }
     return 0;
 }

@@ -471,13 +471,50 @@ static bool whpx_reset_vcpu_state(CPUState *cpu)
     /* Reset APs must wait for INIT/SIPI when the kernel APIC owns startup. */
     values[ARRAY_SIZE(names) - 1].InternalActivity.StartupSuspend =
         whpx_irqchip_in_kernel() && cpu->halted;
+    /* WHP rejects InternalActivityState without its kernel LAPIC. */
     hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
-        whpx_global.partition, cpu->cpu_index, names, ARRAY_SIZE(names), values);
+        whpx_global.partition, cpu->cpu_index, names,
+        whpx_irqchip_in_kernel() ? ARRAY_SIZE(names) : ARRAY_SIZE(names) - 1,
+        values);
 
     if (FAILED(hr)) {
         error_report("WHPX: failed to reset cpu%u pending state, hr=%08lx",
                      cpu->cpu_index, hr);
         return false;
+    }
+    if (X86_CPU(cpu)->env.features[FEAT_1_EDX] & CPUID_MTRR) {
+        WHV_REGISTER_NAME cap_name = WHvX64RegisterMsrMtrrCap;
+        WHV_REGISTER_VALUE cap = {0};
+        WHV_REGISTER_NAME mtrr_names[1 + 11 + 2 * 16];
+        WHV_REGISTER_VALUE mtrr_values[ARRAY_SIZE(mtrr_names)] = {0};
+        unsigned count = 0;
+
+        hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, &cap_name, 1, &cap);
+        if (FAILED(hr) || (cap.Reg64 & 0xff) > 16) {
+            error_report("WHPX: failed to query cpu%u MTRR capacity, hr=%08lx",
+                         cpu->cpu_index, hr);
+            return false;
+        }
+        /* CPU reset zeros MTRRs; leaving FE set makes OVMF assert on warm boot. */
+        mtrr_names[count++] = WHvX64RegisterMsrMtrrDefType;
+        if (cap.Reg64 & MSR_MTRRcap_FIXRANGE_SUPPORT) {
+            for (unsigned i = 0; i < 11; i++) {
+                mtrr_names[count++] = WHvX64RegisterMsrMtrrFix64k00000 + i;
+            }
+        }
+        for (unsigned i = 0; i < (cap.Reg64 & 0xff); i++) {
+            mtrr_names[count++] = WHvX64RegisterMsrMtrrPhysBase0 + i;
+            mtrr_names[count++] = WHvX64RegisterMsrMtrrPhysMask0 + i;
+        }
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, mtrr_names, count,
+            mtrr_values);
+        if (FAILED(hr)) {
+            error_report("WHPX: failed to reset cpu%u MTRRs, hr=%08lx",
+                         cpu->cpu_index, hr);
+            return false;
+        }
     }
     vcpu->window_registered = false;
     vcpu->window_priority = 0;
