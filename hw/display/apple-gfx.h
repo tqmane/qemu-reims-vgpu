@@ -115,8 +115,9 @@ void apple_gfx_activity_end(void);
  * The guest's RAM, as RvgMemoryRange elements: an RvgMemoryMap's ranges.
  * Unless @files is NULL, it gets the file behind each range, as
  * RvgMemoryRangeFile elements in the same order, fd -1 where there is none.
+ * On Windows, @sections receives the sections backing the same ranges.
  */
-GArray *apple_gfx_new_memory_ranges(GArray **files);
+GArray *apple_gfx_new_memory_ranges(GArray **files, GArray **sections);
 
 extern const PropertyInfo qdev_prop_apple_gfx_display_mode;
 

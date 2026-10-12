@@ -9,6 +9,8 @@ struct AccelCPUState {
     bool ready_for_pic_interrupt;
     uint64_t tpr;
     bool interruption_pending;
+    /* A failed XSAVE read must not overwrite the live extended registers. */
+    bool xsave_state_stale;
     /* Must be the last field as it may have a tail */
     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
 };

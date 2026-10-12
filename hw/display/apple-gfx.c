@@ -629,6 +629,9 @@ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
 typedef struct AppleGFXMemoryWalk {
     GArray *ranges;
     GArray *files; /* NULL when the caller wants none */
+#ifdef _WIN32
+    GArray *sections;
+#endif
 } AppleGFXMemoryWalk;
 
 /*
@@ -679,6 +682,18 @@ static bool apple_gfx_add_memory_range(Int128 start, Int128 len,
             file = apple_gfx_memory_range_file(mr, host);
             g_array_append_val(walk->files, file);
         }
+#ifdef _WIN32
+        if (walk->sections) {
+            RAMBlock *rb = mr->ram_block;
+            RvgMemoryRangeSection section = {
+                .handle = (uintptr_t)rb->win32_section,
+                .offset = qemu_ram_block_host_offset(rb, host),
+                .length = rb->max_length,
+            };
+
+            g_array_append_val(walk->sections, section);
+        }
+#endif
         g_array_append_val(walk->ranges, range);
         trace_apple_gfx_memory_range(range.physical_address,
                                      range.physical_length, host, file.fd,
@@ -687,7 +702,7 @@ static bool apple_gfx_add_memory_range(Int128 start, Int128 len,
     return false;
 }
 
-GArray *apple_gfx_new_memory_ranges(GArray **files)
+GArray *apple_gfx_new_memory_ranges(GArray **files, GArray **sections)
 {
     AppleGFXMemoryWalk walk = {
         .ranges = g_array_new(false, false, sizeof(RvgMemoryRange)),
@@ -697,6 +712,14 @@ GArray *apple_gfx_new_memory_ranges(GArray **files)
     if (files) {
         walk.files = g_array_new(false, false, sizeof(RvgMemoryRangeFile));
         *files = walk.files;
+    }
+    if (sections) {
+        *sections = NULL;
+#ifdef _WIN32
+        walk.sections = g_array_new(false, false,
+                                     sizeof(RvgMemoryRangeSection));
+        *sections = walk.sections;
+#endif
     }
     flatview_for_each_range(fv, apple_gfx_add_memory_range, &walk);
     return walk.ranges;
@@ -1007,6 +1030,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     static const char display_name[] = "Reims vGPU";
     g_autoptr(GArray) memory_ranges = NULL;
     g_autoptr(GArray) memory_files = NULL;
+    g_autoptr(GArray) memory_sections = NULL;
     g_autofree RvgDisplayMode *modes = NULL;
     const AppleGFXDisplayMode *display_modes = apple_gfx_default_modes;
     uint32_t num_display_modes = ARRAY_SIZE(apple_gfx_default_modes);
@@ -1069,12 +1093,24 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         }
     }
 
-    /* The library copies the ranges, and duplicates the files' descriptors. */
-    memory_ranges = apple_gfx_new_memory_ranges(&memory_files);
+    /* The library copies the ranges and duplicates their backing handles. */
+    memory_ranges = apple_gfx_new_memory_ranges(&memory_files, &memory_sections);
     if (!apple_gfx_memory_files(memory_ranges, memory_files,
                                 &config->memory_files, errp)) {
         return false;
     }
+#ifdef _WIN32
+    for (i = 0; i < memory_sections->len; i++) {
+        if (!g_array_index(memory_sections, RvgMemoryRangeSection, i).handle) {
+            error_setg(errp, "apple-gfx: guest RAM at 0x%" PRIx64
+                       " is not backed by a Windows section",
+                       g_array_index(memory_ranges, RvgMemoryRange,
+                                     i).physical_address);
+            return false;
+        }
+    }
+    config->memory_sections = (const RvgMemoryRangeSection *)memory_sections->data;
+#endif
     memory_map = (RvgMemoryMap) {
         .ranges = (const RvgMemoryRange *)memory_ranges->data,
         .range_count = memory_ranges->len,

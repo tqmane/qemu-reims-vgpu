@@ -361,7 +361,8 @@ static void whpx_log_sync(MemoryListener *listener,
         return;
     }
 
-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+    memory_region_set_dirty(mr, section->offset_within_region,
+                             int128_get64(section->size));
 }
 
 static MemoryListener whpx_memory_listener = {

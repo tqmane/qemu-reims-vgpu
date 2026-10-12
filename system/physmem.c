@@ -2147,7 +2147,9 @@ static void dirty_memory_extend(ram_addr_t new_ram_size)
 static void ram_block_add(RAMBlock *new_block, Error **errp)
 {
     const bool noreserve = qemu_ram_is_noreserve(new_block);
+#ifndef _WIN32
     const bool shared = qemu_ram_is_shared(new_block);
+#endif
     RAMBlock *block;
     RAMBlock *last_block = NULL;
     bool free_on_error = false;
@@ -2167,9 +2169,16 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
                 return;
             }
         } else {
+#ifdef _WIN32
+            new_block->host = qemu_win32_ram_alloc(new_block->max_length,
+                                                   &new_block->mr->align,
+                                                   noreserve,
+                                                   &new_block->win32_section);
+#else
             new_block->host = qemu_anon_ram_alloc(new_block->max_length,
                                                   &new_block->mr->align,
                                                   shared, noreserve);
+#endif
             if (!new_block->host) {
                 g_autofree char *size_s = size_to_str(new_block->max_length);
                 error_setg_errno(errp, errno,
@@ -2290,6 +2299,10 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
 out_free:
     if (free_on_error) {
         qemu_anon_ram_free(new_block->host, new_block->max_length);
+#ifdef _WIN32
+        CloseHandle(new_block->win32_section);
+        new_block->win32_section = NULL;
+#endif
         new_block->host = NULL;
     }
 }
@@ -2579,6 +2592,9 @@ static void reclaim_ramblock(RAMBlock *block)
 #endif
     } else {
         qemu_anon_ram_free(block->host, block->max_length);
+#ifdef _WIN32
+        CloseHandle(block->win32_section);
+#endif
     }
 
     if (block->guest_memfd >= 0) {

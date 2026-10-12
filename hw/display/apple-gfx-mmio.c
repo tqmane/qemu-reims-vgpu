@@ -96,7 +96,7 @@ static bool apple_gfx_mmio_create_iosurface_device(AppleGFXMMIOState *s,
                                                    Error **errp)
 {
     /* The library copies the ranges. */
-    g_autoptr(GArray) memory_ranges = apple_gfx_new_memory_ranges(NULL);
+    g_autoptr(GArray) memory_ranges = apple_gfx_new_memory_ranges(NULL, NULL);
     RvgMemoryMap memory_map = {
         .ranges = (const RvgMemoryRange *)memory_ranges->data,
         .range_count = memory_ranges->len,

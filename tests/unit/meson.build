@@ -62,6 +62,12 @@ if have_system or have_tools
   endif
 endif
 
+if host_os == 'windows'
+  tests += {'test-win32-ram': []}
+  test('test-symlink-install-tree', python,
+       args: files('test-symlink-install-tree.py'), suite: 'unit')
+endif
+
 if have_block
   tests += {
     'test-coroutine': [testblock],

@@ -540,6 +540,8 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 int qemu_shm_alloc(size_t size, Error **errp);
 
 #ifdef _WIN32
+void *qemu_win32_ram_alloc(size_t size, uint64_t *align, bool noreserve,
+                           HANDLE *section);
 #define HAVE_CHARDEV_SERIAL 1
 #define HAVE_CHARDEV_PARALLEL 1
 #else

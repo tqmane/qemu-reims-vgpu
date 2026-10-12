@@ -877,9 +877,9 @@ endif
 # apple-gfx drives reims-vgpu's C API (reims_vgpu.h), a library found
 # through pkg-config: reims-vgpu.pc, which reims-vgpu's `cargo
 # xtask dist` writes into its target/dist/lib/pkgconfig. It is linked
-# statically, so the binary records no path to it. The library runs on
-# macOS, under HVF, and on Linux, under KVM.
-if host_os in ['darwin', 'linux']
+# statically on macOS (HVF) and Linux (KVM), and through its DLL import
+# library on Windows (WHPX).
+if host_os in ['darwin', 'linux', 'windows']
   pvg = dependency('reims-vgpu', method: 'pkg-config', static: true,
                    required: get_option('pvg'))
   # apple-gfx-pci's default romfile: the EFI option ROM the package's
@@ -5055,7 +5055,7 @@ summary_info += {'libdw':             libdw}
 if host_os == 'freebsd'
   summary_info += {'libinotify-kqueue': inotify}
 endif
-if host_os in ['darwin', 'linux']
+if host_os in ['darwin', 'linux', 'windows']
   summary_info += {'reims-vgpu support': pvg}
 endif
 summary_info += {'valgrind':          valgrind}

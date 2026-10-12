@@ -40,6 +40,9 @@ struct RAMBlock {
     Error *cpr_blocker;
     int fd;
     uint64_t fd_offset;
+#ifdef _WIN32
+    HANDLE win32_section; /* Owns the section behind host, or NULL for prealloc. */
+#endif
     int guest_memfd;
     RamBlockAttributes *attributes;
     size_t page_size;

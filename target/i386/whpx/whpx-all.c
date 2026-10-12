@@ -612,7 +612,7 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu)) {
+        if (whpx_is_xsave_enabled(cpu) && !vcpu->xsave_state_stale) {
             whpx_set_xsave_state(cpu);
         }
         whpx_set_legacy_fp_registers(cpu, level);
@@ -819,7 +819,7 @@ static int whpx_get_xsave_state(CPUState *cpu)
     void *xsavec_buf;
     const size_t page = qemu_real_host_page_size();
     size_t xsavec_buf_len = whpx_get_xsave_max_len();
-    UINT32 bytes_written;
+    UINT32 bytes_written = 0;
 
     xsavec_buf = qemu_memalign(page, xsavec_buf_len);
     memset(xsavec_buf, 0, xsavec_buf_len);
@@ -837,17 +837,21 @@ static int whpx_get_xsave_state(CPUState *cpu)
             xsavec_buf_len, &bytes_written);
     }
     if (FAILED(hr) || bytes_written == 0) {
-        error_report("failed to get xsave state: %s", strerror(errno));
-        return -errno;
+        qemu_vfree(xsavec_buf);
+        cpu->accel->xsave_state_stale = true;
+        error_report("WHPX: failed to get xsave state, hr=%08lx", hr);
+        return -1;
     }
 
     ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
+        cpu->accel->xsave_state_stale = true;
         error_report("failed to decompact xsave area");
         return ret;
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
+    cpu->accel->xsave_state_stale = false;
 
     return 0;
 }
@@ -1031,7 +1035,9 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    bql_lock();
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
@@ -1054,7 +1060,7 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     return 0;
 }
 
-static void whpx_inject_back_gpf(CPUState *cpu)
+static void whpx_inject_back_fault(CPUState *cpu)
 {
     WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
     WHV_REGISTER_VALUE reg = {};
@@ -1065,8 +1071,8 @@ static void whpx_inject_back_gpf(CPUState *cpu)
         return;
     }
 
-    if (ctx->ExceptionType != EXCP0D_GPF) {
-        warn_report("Was asked to inject exception other than GPF.");
+    if (ctx->ExceptionType != EXCP0D_GPF && ctx->ExceptionType != EXCP0E_PAGE) {
+        warn_report("Was asked to inject exception other than GPF or PF.");
         return;
     }
 
@@ -1292,6 +1298,44 @@ static target_ulong read_cr(CPUState *cpu, int cr)
     return val.Reg64;
 }
 
+static bool whpx_access_msr(CPUX86State *env, uint32_t msr, bool write,
+                            uint64_t *value)
+{
+    switch (msr) {
+    case MSR_IA32_SYSENTER_CS:
+        if (write) {
+            env->sysenter_cs = *value;
+        } else {
+            *value = env->sysenter_cs;
+        }
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        if (write) {
+            env->sysenter_esp = *value;
+        } else {
+            *value = env->sysenter_esp;
+        }
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        if (write) {
+            env->sysenter_eip = *value;
+        } else {
+            *value = env->sysenter_eip;
+        }
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        if (write) {
+            env->msr_ia32_misc_enable = *value;
+        } else {
+            *value = env->msr_ia32_misc_enable;
+        }
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
 static bool whpx_simulate_rdmsr(CPUState *cs)
 {
     X86CPU *cpu = X86_CPU(cs);
@@ -1299,12 +1343,10 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     uint32_t msr = ECX(env);
     uint64_t val = 0;
 
-    switch (msr) {
-    default:
+    if (!whpx_access_msr(env, msr, false, &val)) {
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
-        break;
     }
 
     RAX(env) = (uint32_t)val;
@@ -1320,12 +1362,10 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     uint32_t msr = ECX(env);
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
-    switch (msr) {
-    default:
+    if (!whpx_access_msr(env, msr, true, &data)) {
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
-        break;
     }
 
     return 0;
@@ -1488,6 +1528,7 @@ static UINT64 whpx_get_default_exceptions(void)
         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
     }
 
+    intercepts |= 1ULL << WHvX64ExceptionTypePageFault;
     return intercepts;
 }
 
@@ -2389,6 +2430,13 @@ int whpx_vcpu_run(CPUState *cpu)
                 val = X86_CPU(cpu)->env.apic_bus_freq;
             }
 
+            if (whpx_access_msr(&X86_CPU(cpu)->env,
+                                vcpu->exit_ctx.MsrAccess.MsrNumber,
+                                vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite,
+                                &val)) {
+                is_known_msr = 1;
+            }
+
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
                 is_known_msr = 1;
                 if (val & MSR_IA32_APICBASE_RESERVED) {
@@ -2596,15 +2644,17 @@ int whpx_vcpu_run(CPUState *cpu)
             /* Dynamic depending on XCR0 and XSS, so query DefaultResult */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 0x07
                 && vcpu->exit_ctx.CpuidAccess.Rcx == 0) {
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
-                    & CPUID_7_0_EDX_CET_IBT) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
+                     & CPUID_7_0_EDX_CET_IBT) &&
+                    (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_CET_IBT)) {
                     reg_values[3].Reg32 |= CPUID_7_0_EDX_CET_IBT;
                 } else {
                     reg_values[3].Reg32 &= ~CPUID_7_0_EDX_CET_IBT;
                 }
 
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
-                    & CPUID_7_0_ECX_CET_SHSTK) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
+                     & CPUID_7_0_ECX_CET_SHSTK) &&
+                    (env->features[FEAT_7_0_ECX] & CPUID_7_0_ECX_CET_SHSTK)) {
                     reg_values[2].Reg32 |= CPUID_7_0_ECX_CET_SHSTK;
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_7_0_ECX_CET_SHSTK;
@@ -2628,6 +2678,8 @@ int whpx_vcpu_run(CPUState *cpu)
 
             /* OSXSAVE is dynamic. Do this instead of syncing CR4 */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 1) {
+                /* WHPX's LAPIC faults on TSC-deadline timer mode. */
+                reg_values[2].Reg32 &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
                 if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
                     & CPUID_EXT_OSXSAVE) {
                     reg_values[2].Reg32 |= CPUID_EXT_OSXSAVE;
@@ -2651,9 +2703,15 @@ int whpx_vcpu_run(CPUState *cpu)
         }
         case WHvRunVpExitReasonException:
             if (vcpu->exit_ctx.VpException.ExceptionType ==
+                WHvX64ExceptionTypePageFault) {
+                whpx_inject_back_fault(cpu);
+                ret = 0;
+                break;
+            }
+            if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypeGeneralProtectionFault) {
                 if (whpx_handle_msr_from_gpf(cpu)) {
-                    whpx_inject_back_gpf(cpu);
+                    whpx_inject_back_fault(cpu);
                 }
                 ret = 0;
                 break;
@@ -3039,7 +3097,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
