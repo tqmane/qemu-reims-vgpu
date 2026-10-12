@@ -1302,6 +1302,12 @@ static bool whpx_access_msr(CPUX86State *env, uint32_t msr, bool write,
                             uint64_t *value)
 {
     switch (msr) {
+    case MSR_CORE_THREAD_COUNT:
+        if (write) {
+            return false;
+        }
+        *value = cpu_x86_get_msr_core_thread_count(env_archcpu(env));
+        break;
     case MSR_IA32_SYSENTER_CS:
         if (write) {
             env->sysenter_cs = *value;
