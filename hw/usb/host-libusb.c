@@ -295,6 +295,17 @@ static int usb_host_init(void)
     if (rc != 0) {
         return -1;
     }
+#ifdef CONFIG_WIN32
+    if (g_strcmp0(g_getenv("REIMS_USB_BACKEND"), "usbdk") == 0) {
+        rc = libusb_set_option(ctx, LIBUSB_OPTION_USE_USBDK);
+        if (rc != LIBUSB_SUCCESS) {
+            error_report("UsbDk is unavailable: %s", libusb_error_name(rc));
+            libusb_exit(ctx);
+            ctx = NULL;
+            return -1;
+        }
+    }
+#endif
 #if LIBUSB_API_VERSION >= 0x01000106
     libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, loglevel);
 #else
@@ -1947,6 +1958,8 @@ void hmp_info_usbhost(MonitorHMP *hmp, const QDict *qdict)
         monitor_hmp_printf(hmp, "    Class %02x:", ddesc.bDeviceClass);
         monitor_hmp_printf(hmp, " USB device %04x:%04x",
                            ddesc.idVendor, ddesc.idProduct);
+#ifndef CONFIG_WIN32
+        /* UsbDk redirects a device on open, even for a string query. */
         if (ddesc.iProduct) {
             libusb_device_handle *handle;
             if (libusb_open(devs[i], &handle) == 0) {
@@ -1958,6 +1971,7 @@ void hmp_info_usbhost(MonitorHMP *hmp, const QDict *qdict)
                 monitor_hmp_printf(hmp, ", %s", name);
             }
         }
+#endif
         monitor_hmp_printf(hmp, "\n");
     }
     libusb_free_device_list(devs, 1);
