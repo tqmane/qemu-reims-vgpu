@@ -37,6 +37,7 @@
 #include "desc.h"
 #include "qemu/audio.h"
 #include "qom/object.h"
+#include "qapi/error.h"
 
 static void usb_audio_reinit(USBDevice *dev, unsigned channels);
 
@@ -81,8 +82,21 @@ static const USBDescStrings usb_audio_stringtable = {
     [STRING_INPUT_TERMINAL]     = "Audio Output Pipe",
     [STRING_FEATURE_UNIT]       = "Audio Output Volume Control",
     [STRING_OUTPUT_TERMINAL]    = "Audio Output Terminal",
-    [STRING_NULL_STREAM]        = "Audio Output - Disabled",
-    [STRING_REAL_STREAM]        = "Audio Output - 48 kHz Stereo",
+    [STRING_NULL_STREAM]        = "USB Speakers",
+    [STRING_REAL_STREAM]        = "USB Speakers - 48 kHz Stereo",
+};
+
+static const USBDescStrings usb_microphone_stringtable = {
+    [STRING_MANUFACTURER] = "QEMU",
+    [STRING_PRODUCT] = "USB Microphone",
+    [STRING_SERIALNUMBER] = "2",
+    [STRING_CONFIG] = "Microphone Configuration",
+    [STRING_USBAUDIO_CONTROL] = "Microphone",
+    [STRING_INPUT_TERMINAL] = "Microphone",
+    [STRING_FEATURE_UNIT] = "Microphone Volume",
+    [STRING_OUTPUT_TERMINAL] = "Audio Input Pipe",
+    [STRING_NULL_STREAM] = "USB Microphone",
+    [STRING_REAL_STREAM] = "USB Microphone - 48 kHz Stereo",
 };
 
 /*
@@ -636,6 +650,14 @@ struct USBAudioState {
     /* qemu interfaces */
     USBDevice dev;
     AudioBackend *audio_be;
+    SWVoiceIn *input_voice;
+    USBDesc capture_desc;
+    USBDescDevice capture_device;
+    USBDescConfig capture_config;
+    USBDescIface capture_ifaces[3];
+    USBDescOther capture_control[4], capture_stream[2];
+    USBDescEndpoint capture_endpoint;
+    uint8_t capture_terminal[12], capture_output[9], capture_general[7];
 
     /* state */
     struct {
@@ -651,10 +673,35 @@ struct USBAudioState {
     uint32_t debug;
     uint32_t buffer_user, buffer;
     bool multi;
+    bool input;
 };
 
 #define TYPE_USB_AUDIO "usb-audio"
 OBJECT_DECLARE_SIMPLE_TYPE(USBAudioState, USB_AUDIO)
+
+static void input_callback(void *opaque, int avail)
+{
+    USBAudioState *s = opaque;
+    struct streambuf *buf = &s->out.buf;
+
+    while (avail > 0) {
+        size_t offset = buf->prod % buf->size;
+        size_t free = buf->size - (buf->prod - buf->cons);
+        size_t len = MIN(MIN((size_t)avail, free), buf->size - offset);
+        size_t count;
+
+        if (!len) {
+            return;
+        }
+        count = audio_be_read(s->audio_be, s->input_voice,
+                              buf->data + offset, len);
+        buf->prod += count;
+        avail -= count;
+        if (count < len) {
+            return;
+        }
+    }
+}
 
 static void output_callback(void *opaque, int avail)
 {
@@ -681,6 +728,16 @@ static void output_callback(void *opaque, int avail)
 
 static int usb_audio_set_output_altset(USBAudioState *s, int altset)
 {
+    if (s->input) {
+        if (altset != ALTSET_OFF && altset != ALTSET_STEREO) {
+            return -1;
+        }
+        streambuf_init(&s->out.buf, s->buffer, 2);
+        audio_be_set_active_in(s->audio_be, s->input_voice,
+                               altset == ALTSET_STEREO);
+        s->out.altset = altset;
+        return 0;
+    }
     switch (altset) {
     case ALTSET_OFF:
         audio_be_set_active_out(s->audio_be, s->out.voice, false);
@@ -805,7 +862,11 @@ static int usb_audio_set_control(USBAudioState *s, uint8_t attrib,
             }
             fprintf(stderr, "\n");
         }
-        audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+        if (s->input) {
+            audio_be_set_volume_in(s->audio_be, s->input_voice, &s->out.vol);
+        } else {
+            audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+        }
     }
 
     return ret;
@@ -909,7 +970,28 @@ static void usb_audio_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBAudioState *s = (USBAudioState *) dev;
 
-    if (p->pid == USB_TOKEN_OUT && p->ep->nr == 1) {
+    if (s->input && p->pid == USB_TOKEN_IN && p->ep->nr == 1 &&
+        s->out.altset == ALTSET_STEREO) {
+        uint8_t packet[USBAUDIO_PACKET_SIZE(2)] = { 0 };
+        size_t size = MIN(p->iov.size, sizeof(packet)) & ~3U;
+        size_t copied = 0;
+
+        while (copied < size) {
+            size_t len;
+            uint8_t *data = streambuf_get(&s->out.buf, &len);
+            if (!data) {
+                break;
+            }
+            len = MIN(len, size - copied);
+            memcpy(packet + copied, data, len);
+            s->out.buf.cons += len;
+            copied += len;
+        }
+        /* A capture underrun is silence, never stale host memory. */
+        usb_packet_copy(p, packet, size);
+        return;
+    }
+    if (!s->input && p->pid == USB_TOKEN_OUT && p->ep->nr == 1) {
         usb_audio_handle_dataout(s, p);
         return;
     }
@@ -931,9 +1013,46 @@ static void usb_audio_unrealize(USBDevice *dev)
     }
 
     usb_audio_set_output_altset(s, ALTSET_OFF);
-    audio_be_close_out(s->audio_be, s->out.voice);
+    if (s->input) {
+        audio_be_close_in(s->audio_be, s->input_voice);
+    } else {
+        audio_be_close_out(s->audio_be, s->out.voice);
+    }
 
     streambuf_fini(&s->out.buf);
+}
+
+static void usb_audio_capture_descriptor(USBAudioState *s)
+{
+    s->capture_desc = desc_audio;
+    s->capture_device = desc_device;
+    s->capture_config = desc_device.confs[0];
+    memcpy(s->capture_ifaces, desc_iface, sizeof(s->capture_ifaces));
+    memcpy(s->capture_control, desc_iface[0].descs, sizeof(s->capture_control));
+    memcpy(s->capture_stream, desc_iface[2].descs, sizeof(s->capture_stream));
+    s->capture_endpoint = desc_iface[2].eps[0];
+    memcpy(s->capture_terminal, desc_iface[0].descs[1].data, sizeof(s->capture_terminal));
+    memcpy(s->capture_output, desc_iface[0].descs[3].data, sizeof(s->capture_output));
+    memcpy(s->capture_general, desc_iface[2].descs[0].data, sizeof(s->capture_general));
+    /* Microphone -> feature unit -> USB streaming terminal, endpoint IN. */
+    s->capture_terminal[4] = 0x01;
+    s->capture_terminal[5] = 0x02;
+    s->capture_output[4] = 0x01;
+    s->capture_output[5] = 0x01;
+    s->capture_general[3] = 0x03;
+    s->capture_endpoint.bEndpointAddress = USB_DIR_IN | 0x01;
+    s->capture_endpoint.bmAttributes = 0x05; /* isochronous, asynchronous */
+    s->capture_control[1].data = s->capture_terminal;
+    s->capture_control[3].data = s->capture_output;
+    s->capture_stream[0].data = s->capture_general;
+    s->capture_ifaces[0].descs = s->capture_control;
+    s->capture_ifaces[2].descs = s->capture_stream;
+    s->capture_ifaces[2].eps = &s->capture_endpoint;
+    s->capture_config.ifs = s->capture_ifaces;
+    s->capture_device.confs = &s->capture_config;
+    s->capture_desc.full = &s->capture_device;
+    s->capture_desc.id.idProduct = 0x0003;
+    s->capture_desc.str = usb_microphone_stringtable;
 }
 
 static void usb_audio_realize(USBDevice *dev, Error **errp)
@@ -944,8 +1063,20 @@ static void usb_audio_realize(USBDevice *dev, Error **errp)
     if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }
+    if (s->input && s->multi) {
+        error_setg(errp, "USB microphone supports stereo capture only");
+        return;
+    }
+    if (s->buffer_user && s->buffer_user < USBAUDIO_PACKET_SIZE(USBAUDIO_MAX_CHANNELS(s))) {
+        error_setg(errp, "USB audio buffer must hold at least one packet");
+        return;
+    }
 
     dev->usb_desc = s->multi ? &desc_audio_multi : &desc_audio;
+    if (s->input) {
+        usb_audio_capture_descriptor(s);
+        dev->usb_desc = &s->capture_desc;
+    }
 
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
@@ -978,6 +1109,15 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
     s->out.as.big_endian = false;
     streambuf_init(&s->out.buf, s->buffer, s->out.channels);
 
+    if (s->input) {
+        s->input_voice = audio_be_open_in(s->audio_be, s->input_voice,
+                                          "USB microphone", s,
+                                          input_callback, &s->out.as);
+        audio_be_set_volume_in(s->audio_be, s->input_voice, &s->out.vol);
+        audio_be_set_active_in(s->audio_be, s->input_voice, false);
+        return;
+    }
+
     s->out.voice = audio_be_open_out(s->audio_be, s->out.voice, TYPE_USB_AUDIO,
                                 s, output_callback, &s->out.as);
     audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
@@ -994,6 +1134,7 @@ static const Property usb_audio_properties[] = {
     DEFINE_PROP_UINT32("debug", USBAudioState, debug, 0),
     DEFINE_PROP_UINT32("buffer", USBAudioState, buffer_user, 0),
     DEFINE_PROP_BOOL("multi", USBAudioState, multi, false),
+    DEFINE_PROP_BOOL("input", USBAudioState, input, false),
 };
 
 static void usb_audio_class_init(ObjectClass *klass, const void *data)

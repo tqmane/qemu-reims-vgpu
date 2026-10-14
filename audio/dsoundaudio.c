@@ -610,24 +610,6 @@ audio_dsound_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
         return false;
     }
 
-    hr = CoCreateInstance (
-        &CLSID_DirectSoundCapture,
-        NULL,
-        CLSCTX_ALL,
-        &IID_IDirectSoundCapture,
-        (void **) &s->dsound_capture
-        );
-    if (FAILED (hr)) {
-        dserror_set(errp, hr, "Could not create DirectSoundCapture instance");
-        return false;
-    }
-
-    hr = IDirectSoundCapture_Initialize (s->dsound_capture, NULL);
-    if (FAILED(hr)) {
-        dserror_set(errp, hr, "Could not initialize DirectSoundCapture");
-        return false;
-    }
-
     hr = IDirectSound_SetCooperativeLevel (
         s->dsound,
         GetDesktopWindow(),

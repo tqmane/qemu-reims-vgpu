@@ -423,6 +423,30 @@ static void test_xhci_isoch_ep_type_mismatch(void)
     xhci_test_end(&x);
 }
 
+static void test_usb_microphone(void)
+{
+    QTestState *qts = qtest_init("-nodefaults -device qemu-xhci,id=xhci "
+                               "-audiodev none,id=capture");
+    QDict *error;
+
+    error = qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'device_add','arguments':{'driver':'usb-audio',"
+        "'id':'bad-mic','audiodev':'capture','input':true,'multi':true}}");
+    qobject_unref(error);
+    error = qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'device_add','arguments':{'driver':'usb-audio',"
+        "'id':'tiny-mic','audiodev':'capture','input':true,'buffer':1}}");
+    qobject_unref(error);
+    qtest_qmp_device_add(qts, "usb-audio", "mic",
+                         "{'audiodev':'capture','input':true}");
+    qtest_qmp_device_del(qts, "mic");
+    /* Reuse after removal exercises voice and descriptor lifetime. */
+    qtest_qmp_device_add(qts, "usb-audio", "mic2",
+                         "{'audiodev':'capture','input':true}");
+    qtest_qmp_device_del(qts, "mic2");
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -441,6 +465,7 @@ int main(int argc, char **argv)
                    test_xhci_isoch_mfindex_32bit);
     qtest_add_func("/xhci/pci/isoch/ep-type-mismatch",
                    test_xhci_isoch_ep_type_mismatch);
+    qtest_add_func("/xhci/pci/audio/microphone", test_usb_microphone);
 
     qtest_start("-device nec-usb-xhci,id=xhci"
                 " -drive id=drive0,if=none,file=null-co://,"
