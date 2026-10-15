@@ -281,6 +281,14 @@ struct MachineClass {
     int (*get_physical_address_range)(MachineState *machine,
         int default_ipa_size, int max_ipa_size);
     bool (*get_kernel_irqchip_default) (const MachineState *machine);
+    /*
+     * Guest physical addresses of the GICv3 distributor and (first)
+     * redistributor region, for accelerators (HVF) that must place an
+     * in-kernel vGIC before any vCPU exists. Returns false when the
+     * board has no GICv3.
+     */
+    bool (*get_vgic_bases) (const MachineState *machine,
+                            uint64_t *dist_base, uint64_t *redist_base);
 
     BlockInterfaceType block_default_type;
     int units_per_default_bus;
@@ -322,8 +330,8 @@ struct MachineClass {
     SMPCompatProps smp_props;
     const char *default_ram_id;
 
-    HotplugHandler *(*get_hotplug_handler)(MachineState *machine,
-                                           DeviceState *dev);
+    const HotplugHandler *(*get_hotplug_handler)(MachineState *machine,
+                                                 DeviceState *dev);
     bool (*hotplug_allowed)(MachineState *state, DeviceState *dev,
                             Error **errp);
     CpuInstanceProperties (*cpu_index_to_instance_props)(MachineState *machine,
@@ -514,7 +522,7 @@ struct MachineState {
  */
 
 #define DEFINE_MACHINE_EXTENDED(namestr, PARENT_NAME, InstanceName, \
-                                machine_initfn, ABSTRACT, ifaces...) \
+                                machine_initfn, ABSTRACT, SECURE, ifaces...) \
     static void machine_initfn##_class_init(ObjectClass *oc, const void *data) \
     { \
         MachineClass *mc = MACHINE_CLASS(oc); \
@@ -526,6 +534,7 @@ struct MachineState {
         .class_init = machine_initfn##_class_init, \
         .instance_size = sizeof(InstanceName), \
         .abstract = ABSTRACT, \
+        .secure     = SECURE, \
         .interfaces = ifaces, \
     }; \
     static void machine_initfn##_register_types(void) \
@@ -534,17 +543,31 @@ struct MachineState {
     } \
     type_init(machine_initfn##_register_types)
 
+/* Implicitly insecure */
 #define DEFINE_MACHINE(namestr, machine_initfn) \
     DEFINE_MACHINE_EXTENDED(namestr, MACHINE, MachineState, machine_initfn, \
-                            false, NULL)
+                            false, false, NULL)
 
-#define DEFINE_MACHINE_WITH_INTERFACE_ARRAY(namestr, machine_initfn, ifaces...)\
+#define DEFINE_MACHINE_WITH_INTERFACE_ARRAY(namestr, machine_initfn, ifaces...) \
     DEFINE_MACHINE_EXTENDED(namestr, MACHINE, MachineState, machine_initfn, \
-                            false, ifaces)
+                            false, false, ifaces)
 
-#define DEFINE_MACHINE_WITH_INTERFACES(namestr, machine_initfn, ...) \
+#define DEFINE_MACHINE_WITH_INTERFACES(namestr, machine_initfn, ...)    \
     DEFINE_MACHINE_WITH_INTERFACE_ARRAY(namestr, machine_initfn, \
                                         (const InterfaceInfo[]) { __VA_ARGS__ })
+
+
+#define DEFINE_SECURE_MACHINE(namestr, machine_initfn) \
+    DEFINE_MACHINE_EXTENDED(namestr, MACHINE, MachineState, machine_initfn, \
+                            false, true, NULL)
+
+#define DEFINE_SECURE_MACHINE_WITH_INTERFACE_ARRAY(namestr, machine_initfn, ifaces...) \
+    DEFINE_MACHINE_EXTENDED(namestr, MACHINE, MachineState, machine_initfn, \
+                            false, true, ifaces)
+
+#define DEFINE_SECURE_MACHINE_WITH_INTERFACES(namestr, machine_initfn, ...) \
+    DEFINE_SECURE_MACHINE_WITH_INTERFACE_ARRAY(namestr, machine_initfn, \
+                                               (const InterfaceInfo[]) { __VA_ARGS__ })
 
 /*
  * Helper for dispatching different macros based on how
@@ -814,6 +837,9 @@ compat_props_add(GPtrArray *arr,
         g_ptr_array_add(arr, (void *)&props[i]);
     }
 }
+
+extern GlobalProperty hw_compat_11_1[];
+extern const size_t hw_compat_11_1_len;
 
 extern GlobalProperty hw_compat_11_0[];
 extern const size_t hw_compat_11_0_len;

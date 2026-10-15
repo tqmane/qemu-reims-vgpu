@@ -44,10 +44,13 @@ static int get_allocation_granularity(void)
     return system_info.dwAllocationGranularity;
 }
 
-void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
-                          bool noreserve)
+void *qemu_win32_ram_alloc(size_t size, uint64_t *align, bool noreserve,
+                           HANDLE *section)
 {
     void *ptr;
+    HANDLE mapping;
+
+    *section = NULL;
 
     if (noreserve) {
         /*
@@ -55,14 +58,39 @@ void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
          * area; we cannot easily mimic POSIX MAP_NORESERVE semantics.
          */
         error_report("Skipping reservation of swap space is not supported.");
+        errno = ENOTSUP;
         return NULL;
     }
 
-    ptr = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                 (uint64_t)size >> 32, (DWORD)size, NULL);
+    if (!mapping) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    ptr = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size);
     trace_qemu_anon_ram_alloc(size, ptr);
+    if (!ptr) {
+        CloseHandle(mapping);
+        errno = ENOMEM;
+        return NULL;
+    }
+    *section = mapping;
 
-    if (ptr && align) {
+    if (align) {
         *align = MAX(get_allocation_granularity(), getpagesize());
+    }
+    return ptr;
+}
+
+void *qemu_anon_ram_alloc(size_t size, uint64_t *align, bool shared,
+                          bool noreserve)
+{
+    HANDLE section;
+    void *ptr = qemu_win32_ram_alloc(size, align, noreserve, &section);
+
+    if (section) {
+        CloseHandle(section);
     }
     return ptr;
 }
@@ -71,7 +99,7 @@ void qemu_anon_ram_free(void *ptr, size_t size)
 {
     trace_qemu_anon_ram_free(ptr, size);
     if (ptr) {
-        VirtualFree(ptr, 0, MEM_RELEASE);
+        UnmapViewOfFile(ptr);
     }
 }
 

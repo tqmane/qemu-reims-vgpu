@@ -215,7 +215,7 @@ static const USBDescIface desc_iface_keyboard = {
                 0x00,          /*  u8  country_code */
                 0x01,          /*  u8  num_descriptors */
                 USB_DT_REPORT, /*  u8  type: Report */
-                0x3f, 0,       /*  u16 len */
+                0x40, 0,       /*  u16 len */
             },
         },
     },
@@ -246,7 +246,7 @@ static const USBDescIface desc_iface_keyboard2 = {
                 0x00,          /*  u8  country_code */
                 0x01,          /*  u8  num_descriptors */
                 USB_DT_REPORT, /*  u8  type: Report */
-                0x3f, 0,       /*  u16 len */
+                0x40, 0,       /*  u16 len */
             },
         },
     },
@@ -550,7 +550,7 @@ static const uint8_t qemu_keyboard_hid_report_descriptor[] = {
     0x95, 0x06,		/*   Report Count (6) */
     0x75, 0x08,		/*   Report Size (8) */
     0x15, 0x00,		/*   Logical Minimum (0) */
-    0x25, 0xff,		/*   Logical Maximum (255) */
+    0x26, 0xff, 0x00,	/*   Logical Maximum (255, positive signed item) */
     0x05, 0x07,		/*   Usage Page (Key Codes) */
     0x19, 0x00,		/*   Usage Minimum (0) */
     0x29, 0xff,		/*   Usage Maximum (255) */

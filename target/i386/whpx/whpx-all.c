@@ -21,6 +21,7 @@
 #include "system/cpus.h"
 #include "system/runstate.h"
 #include "qemu/main-loop.h"
+#include "qemu/lockable.h"
 #include "qemu/memalign.h"
 #include "hw/core/boards.h"
 #include "hw/intc/ioapic.h"
@@ -55,6 +56,10 @@
 #define HV_X64_MSR_APIC_FREQUENCY       0x40000023
 #define HV_X64_MSR_VP_ASSIST_PAGE       0x40000073
 #define HV_X64_MSR_GUEST_IDLE           0x400000f0
+
+#ifndef WHV_E_INSUFFICIENT_BUFFER
+#define WHV_E_INSUFFICIENT_BUFFER ((HRESULT)0x80370301)
+#endif
 
 static bool is_modern_os = true;
 
@@ -115,7 +120,7 @@ static const WHV_REGISTER_NAME whpx_register_names[] = {
 #ifdef TARGET_X86_64
     WHvX64RegisterKernelGsBase,
 #endif
-    /* WHvX64RegisterPat, */
+    WHvX64RegisterPat,
     WHvX64RegisterSysenterCs,
     WHvX64RegisterSysenterEip,
     WHvX64RegisterSysenterEsp,
@@ -418,8 +423,9 @@ static int whpx_set_xsave_state(const CPUState *cpu)
     size_t xsavec_buf_len;
 
     /* allocate and populate compacted buffer */
-    xsavec_buf_len = whpx_get_xsave_max_len();
+    xsavec_buf_len = MAX(whpx_get_xsave_max_len(), cpu->accel->xsave_state_size);
     xsavec_buf = qemu_memalign(page, xsavec_buf_len);
+    memset(xsavec_buf, 0, xsavec_buf_len);
 
     /* save registers to standard format buffer */
     x86_cpu_xsave_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
@@ -447,6 +453,77 @@ static int whpx_set_xsave_state(const CPUState *cpu)
     }
 
     return 0;
+}
+
+static bool whpx_reset_vcpu_state(CPUState *cpu)
+{
+    static const WHV_REGISTER_NAME names[] = {
+        WHvRegisterPendingInterruption,
+        WHvRegisterPendingEvent,
+        WHvRegisterInterruptState,
+        WHvX64RegisterDeliverabilityNotifications,
+        WHvRegisterInternalActivityState,
+    };
+    WHV_REGISTER_VALUE values[ARRAY_SIZE(names)] = {0};
+    HRESULT hr;
+    AccelCPUState *vcpu = cpu->accel;
+
+    /* Reset APs must wait for INIT/SIPI when the kernel APIC owns startup. */
+    values[ARRAY_SIZE(names) - 1].InternalActivity.StartupSuspend =
+        whpx_irqchip_in_kernel() && cpu->halted;
+    /* WHP rejects InternalActivityState without its kernel LAPIC. */
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx_global.partition, cpu->cpu_index, names,
+        whpx_irqchip_in_kernel() ? ARRAY_SIZE(names) : ARRAY_SIZE(names) - 1,
+        values);
+
+    if (FAILED(hr)) {
+        error_report("WHPX: failed to reset cpu%u pending state, hr=%08lx",
+                     cpu->cpu_index, hr);
+        return false;
+    }
+    if (X86_CPU(cpu)->env.features[FEAT_1_EDX] & CPUID_MTRR) {
+        WHV_REGISTER_NAME cap_name = WHvX64RegisterMsrMtrrCap;
+        WHV_REGISTER_VALUE cap = {0};
+        WHV_REGISTER_NAME mtrr_names[1 + 11 + 2 * 16];
+        WHV_REGISTER_VALUE mtrr_values[ARRAY_SIZE(mtrr_names)] = {0};
+        unsigned count = 0;
+
+        hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, &cap_name, 1, &cap);
+        if (FAILED(hr) || (cap.Reg64 & 0xff) > 16) {
+            error_report("WHPX: failed to query cpu%u MTRR capacity, hr=%08lx",
+                         cpu->cpu_index, hr);
+            return false;
+        }
+        /* CPU reset zeros MTRRs; leaving FE set makes OVMF assert on warm boot. */
+        mtrr_names[count++] = WHvX64RegisterMsrMtrrDefType;
+        if (cap.Reg64 & MSR_MTRRcap_FIXRANGE_SUPPORT) {
+            for (unsigned i = 0; i < 11; i++) {
+                mtrr_names[count++] = WHvX64RegisterMsrMtrrFix64k00000 + i;
+            }
+        }
+        for (unsigned i = 0; i < (cap.Reg64 & 0xff); i++) {
+            mtrr_names[count++] = WHvX64RegisterMsrMtrrPhysBase0 + i;
+            mtrr_names[count++] = WHvX64RegisterMsrMtrrPhysMask0 + i;
+        }
+        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+            whpx_global.partition, cpu->cpu_index, mtrr_names, count,
+            mtrr_values);
+        if (FAILED(hr)) {
+            error_report("WHPX: failed to reset cpu%u MTRRs, hr=%08lx",
+                         cpu->cpu_index, hr);
+            return false;
+        }
+    }
+    vcpu->window_registered = false;
+    vcpu->window_priority = 0;
+    vcpu->interruptable = false;
+    vcpu->ready_for_pic_interrupt = false;
+    vcpu->interruption_pending = false;
+    vcpu->xsave_state_stale = false;
+    memset(&vcpu->exit_ctx, 0, sizeof(vcpu->exit_ctx));
+    return true;
 }
 
 static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
@@ -527,6 +604,12 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
     int v86, r86;
 
     assert(cpu_is_stopped(cpu) || qemu_cpu_is_self(cpu));
+
+    if (level == WHPX_LEVEL_RESET_STATE && !whpx_reset_vcpu_state(cpu)) {
+        BQL_LOCK_GUARD();
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return;
+    }
 
     /*
      * Following MSRs have side effects on the guest or are too heavy for
@@ -612,11 +695,12 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
          */
         whpx_set_xcrs(cpu);
 
-        if (whpx_is_xsave_enabled(cpu)) {
+        if ((level == WHPX_LEVEL_RESET_STATE && whpx_has_xsave()) ||
+            (whpx_is_xsave_enabled(cpu) && !vcpu->xsave_state_stale)) {
             whpx_set_xsave_state(cpu);
-        } else {
-            whpx_set_legacy_fp_registers(cpu, level);
         }
+        whpx_set_legacy_fp_registers(cpu, level);
+
         /* MSRs */
         assert(whpx_register_names[idx] == WHvX64RegisterEfer);
         vcxt.values[idx++].Reg64 = env->efer;
@@ -624,9 +708,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
         assert(whpx_register_names[idx] == WHvX64RegisterKernelGsBase);
         vcxt.values[idx++].Reg64 = env->kernelgsbase;
 #endif
-
-        /* WHvX64RegisterPat - Skipped */
-
+        assert(whpx_register_names[idx] == WHvX64RegisterPat);
+        vcxt.values[idx++].Reg64 = env->pat;
         assert(whpx_register_names[idx] == WHvX64RegisterSysenterCs);
         vcxt.values[idx++].Reg64 = env->sysenter_cs;
         assert(whpx_register_names[idx] == WHvX64RegisterSysenterEip);
@@ -819,36 +902,51 @@ static int whpx_get_xsave_state(CPUState *cpu)
     HRESULT hr;
     void *xsavec_buf;
     const size_t page = qemu_real_host_page_size();
-    size_t xsavec_buf_len = whpx_get_xsave_max_len();
-    UINT32 bytes_written;
+    size_t xsavec_buf_len = MAX(whpx_get_xsave_max_len(),
+                               cpu->accel->xsave_state_size);
+    UINT32 bytes_written = 0;
 
-    xsavec_buf = qemu_memalign(page, xsavec_buf_len);
-    memset(xsavec_buf, 0, xsavec_buf_len);
-
-    if (!whpx_is_legacy_os()) {
-        hr = whp_dispatch.WHvGetVirtualProcessorState(
-            whpx->partition, cpu->cpu_index,
-            WHvVirtualProcessorStateTypeXsaveState,
-            xsavec_buf,
-            xsavec_buf_len, &bytes_written);
-    } else {
-        hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
-            whpx->partition, cpu->cpu_index,
-            xsavec_buf,
-            xsavec_buf_len, &bytes_written);
+    for (unsigned attempt = 0; ; attempt++) {
+        xsavec_buf = qemu_memalign(page, xsavec_buf_len);
+        memset(xsavec_buf, 0, xsavec_buf_len);
+        bytes_written = 0;
+        if (!whpx_is_legacy_os()) {
+            hr = whp_dispatch.WHvGetVirtualProcessorState(
+                whpx->partition, cpu->cpu_index,
+                WHvVirtualProcessorStateTypeXsaveState,
+                xsavec_buf, xsavec_buf_len, &bytes_written);
+        } else {
+            hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
+                whpx->partition, cpu->cpu_index,
+                xsavec_buf, xsavec_buf_len, &bytes_written);
+        }
+        if (attempt != 0 || hr != WHV_E_INSUFFICIENT_BUFFER ||
+            bytes_written <= xsavec_buf_len) {
+            break;
+        }
+        qemu_vfree(xsavec_buf);
+        xsavec_buf_len = bytes_written;
     }
-    if (FAILED(hr) || bytes_written == 0) {
-        error_report("failed to get xsave state: %s", strerror(errno));
-        return -errno;
+    if (FAILED(hr) || bytes_written < sizeof(X86LegacyXSaveArea) +
+                                     sizeof(X86XSaveHeader) ||
+        bytes_written > xsavec_buf_len) {
+        qemu_vfree(xsavec_buf);
+        cpu->accel->xsave_state_stale = true;
+        error_report("WHPX: failed to get xsave state, hr=%08lx "
+                     "buffer=%zu required=%u", hr, xsavec_buf_len, bytes_written);
+        return -1;
     }
 
-    ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
+    ret = decompact_xsave_area(xsavec_buf, bytes_written, env);
     qemu_vfree(xsavec_buf);
     if (ret < 0) {
+        cpu->accel->xsave_state_stale = true;
         error_report("failed to decompact xsave area");
         return ret;
     }
     x86_cpu_xrstor_all_areas(x86cpu, env->xsave_buf, env->xsave_buf_len);
+    cpu->accel->xsave_state_stale = false;
+    cpu->accel->xsave_state_size = xsavec_buf_len;
 
     return 0;
 }
@@ -951,9 +1049,8 @@ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
 
     if (whpx_is_xsave_enabled(cpu)) {
         whpx_get_xsave_state(cpu);
-    } else {
-        whpx_get_legacy_fp_registers(cpu, level);
     }
+    whpx_get_legacy_fp_registers(cpu, level);
 
     /* MSRs */
     assert(whpx_register_names[idx] == WHvX64RegisterEfer);
@@ -962,9 +1059,8 @@ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
     assert(whpx_register_names[idx] == WHvX64RegisterKernelGsBase);
     env->kernelgsbase = vcxt.values[idx++].Reg64;
 #endif
-
-    /* WHvX64RegisterPat - Skipped */
-
+    assert(whpx_register_names[idx] == WHvX64RegisterPat);
+    env->pat = vcxt.values[idx++].Reg64;
     assert(whpx_register_names[idx] == WHvX64RegisterSysenterCs);
     env->sysenter_cs = vcxt.values[idx++].Reg64;
     assert(whpx_register_names[idx] == WHvX64RegisterSysenterEip);
@@ -1034,7 +1130,9 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_RUN_VP_EXIT_CONTEXT *exit_ctx)
     WHV_MEMORY_ACCESS_CONTEXT *ctx = &exit_ctx->MemoryAccess;
     int ret;
 
+    bql_lock();
     ret = emulate_instruction(cpu, ctx->InstructionBytes, ctx->InstructionByteCount);
+    bql_unlock();
     if (ret < 0) {
         error_report("failed to emulate mmio");
         return -1;
@@ -1057,7 +1155,7 @@ static int whpx_handle_msr_from_gpf(CPUState *cpu)
     return 0;
 }
 
-static void whpx_inject_back_gpf(CPUState *cpu)
+static void whpx_inject_back_fault(CPUState *cpu)
 {
     WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
     WHV_REGISTER_VALUE reg = {};
@@ -1068,8 +1166,33 @@ static void whpx_inject_back_gpf(CPUState *cpu)
         return;
     }
 
-    if (ctx->ExceptionType != EXCP0D_GPF) {
-        warn_report("Was asked to inject exception other than GPF.");
+    if (ctx->ExceptionType != EXCP0D_GPF && ctx->ExceptionType != EXCP0E_PAGE) {
+        warn_report("Was asked to inject exception other than GPF or PF.");
+        return;
+    }
+
+    reg.ExceptionEvent.EventPending = 1;
+    reg.ExceptionEvent.EventType = WHvX64PendingEventException;
+    reg.ExceptionEvent.DeliverErrorCode = ctx->ExceptionInfo.ErrorCodeValid;
+    reg.ExceptionEvent.Vector = ctx->ExceptionType;
+    reg.ExceptionEvent.ErrorCode = ctx->ErrorCode;
+    reg.ExceptionEvent.ExceptionParameter = ctx->ExceptionParameter;
+    whpx_set_reg(cpu, WHvRegisterPendingEvent, reg);
+}
+
+static void whpx_inject_back_db(CPUState *cpu)
+{
+    WHV_VP_EXCEPTION_CONTEXT *ctx = &cpu->accel->exit_ctx.VpException;
+    WHV_REGISTER_VALUE reg = {};
+
+    if (ctx->ExceptionInfo.SoftwareException) {
+        /* TODO */
+        warn_report("Was asked to inject software exception.");
+        return;
+    }
+
+    if (ctx->ExceptionType != EXCP01_DB) {
+        warn_report("Was asked to inject exception other than debug.");
         return;
     }
 
@@ -1270,6 +1393,50 @@ static target_ulong read_cr(CPUState *cpu, int cr)
     return val.Reg64;
 }
 
+static bool whpx_access_msr(CPUX86State *env, uint32_t msr, bool write,
+                            uint64_t *value)
+{
+    switch (msr) {
+    case MSR_CORE_THREAD_COUNT:
+        if (write) {
+            return false;
+        }
+        *value = cpu_x86_get_msr_core_thread_count(env_archcpu(env));
+        break;
+    case MSR_IA32_SYSENTER_CS:
+        if (write) {
+            env->sysenter_cs = *value;
+        } else {
+            *value = env->sysenter_cs;
+        }
+        break;
+    case MSR_IA32_SYSENTER_ESP:
+        if (write) {
+            env->sysenter_esp = *value;
+        } else {
+            *value = env->sysenter_esp;
+        }
+        break;
+    case MSR_IA32_SYSENTER_EIP:
+        if (write) {
+            env->sysenter_eip = *value;
+        } else {
+            *value = env->sysenter_eip;
+        }
+        break;
+    case MSR_IA32_MISC_ENABLE:
+        if (write) {
+            env->msr_ia32_misc_enable = *value;
+        } else {
+            *value = env->msr_ia32_misc_enable;
+        }
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
 static bool whpx_simulate_rdmsr(CPUState *cs)
 {
     X86CPU *cpu = X86_CPU(cs);
@@ -1277,12 +1444,10 @@ static bool whpx_simulate_rdmsr(CPUState *cs)
     uint32_t msr = ECX(env);
     uint64_t val = 0;
 
-    switch (msr) {
-    default:
+    if (!whpx_access_msr(env, msr, false, &val)) {
         error_report("WHPX: unknown msr 0x%x", msr);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
-        break;
     }
 
     RAX(env) = (uint32_t)val;
@@ -1298,12 +1463,10 @@ static bool whpx_simulate_wrmsr(CPUState *cs)
     uint32_t msr = ECX(env);
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
-    switch (msr) {
-    default:
+    if (!whpx_access_msr(env, msr, true, &data)) {
         error_report("WHPX: unknown msr 0x%x val %llx", msr, data);
         x86_emul_raise_exception(&X86_CPU(cpu)->env, EXCP0D_GPF, 0);
         return 1;
-        break;
     }
 
     return 0;
@@ -1466,6 +1629,7 @@ static UINT64 whpx_get_default_exceptions(void)
         intercepts |= 1UL << WHvX64ExceptionTypeGeneralProtectionFault;
     }
 
+    intercepts |= 1ULL << WHvX64ExceptionTypePageFault;
     return intercepts;
 }
 
@@ -2367,6 +2531,13 @@ int whpx_vcpu_run(CPUState *cpu)
                 val = X86_CPU(cpu)->env.apic_bus_freq;
             }
 
+            if (whpx_access_msr(&X86_CPU(cpu)->env,
+                                vcpu->exit_ctx.MsrAccess.MsrNumber,
+                                vcpu->exit_ctx.MsrAccess.AccessInfo.IsWrite,
+                                &val)) {
+                is_known_msr = 1;
+            }
+
             if (vcpu->exit_ctx.MsrAccess.MsrNumber == MSR_IA32_APICBASE) {
                 is_known_msr = 1;
                 if (val & MSR_IA32_APICBASE_RESERVED) {
@@ -2574,15 +2745,17 @@ int whpx_vcpu_run(CPUState *cpu)
             /* Dynamic depending on XCR0 and XSS, so query DefaultResult */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 0x07
                 && vcpu->exit_ctx.CpuidAccess.Rcx == 0) {
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
-                    & CPUID_7_0_EDX_CET_IBT) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRdx
+                     & CPUID_7_0_EDX_CET_IBT) &&
+                    (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_CET_IBT)) {
                     reg_values[3].Reg32 |= CPUID_7_0_EDX_CET_IBT;
                 } else {
                     reg_values[3].Reg32 &= ~CPUID_7_0_EDX_CET_IBT;
                 }
 
-                if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
-                    & CPUID_7_0_ECX_CET_SHSTK) {
+                if ((vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
+                     & CPUID_7_0_ECX_CET_SHSTK) &&
+                    (env->features[FEAT_7_0_ECX] & CPUID_7_0_ECX_CET_SHSTK)) {
                     reg_values[2].Reg32 |= CPUID_7_0_ECX_CET_SHSTK;
                 } else {
                     reg_values[2].Reg32 &= ~CPUID_7_0_ECX_CET_SHSTK;
@@ -2606,6 +2779,8 @@ int whpx_vcpu_run(CPUState *cpu)
 
             /* OSXSAVE is dynamic. Do this instead of syncing CR4 */
             if (vcpu->exit_ctx.CpuidAccess.Rax == 1) {
+                /* WHPX's LAPIC faults on TSC-deadline timer mode. */
+                reg_values[2].Reg32 &= ~CPUID_EXT_TSC_DEADLINE_TIMER;
                 if (vcpu->exit_ctx.CpuidAccess.DefaultResultRcx
                     & CPUID_EXT_OSXSAVE) {
                     reg_values[2].Reg32 |= CPUID_EXT_OSXSAVE;
@@ -2629,9 +2804,15 @@ int whpx_vcpu_run(CPUState *cpu)
         }
         case WHvRunVpExitReasonException:
             if (vcpu->exit_ctx.VpException.ExceptionType ==
+                WHvX64ExceptionTypePageFault) {
+                whpx_inject_back_fault(cpu);
+                ret = 0;
+                break;
+            }
+            if (vcpu->exit_ctx.VpException.ExceptionType ==
                 WHvX64ExceptionTypeGeneralProtectionFault) {
                 if (whpx_handle_msr_from_gpf(cpu)) {
-                    whpx_inject_back_gpf(cpu);
+                    whpx_inject_back_fault(cpu);
                 }
                 ret = 0;
                 break;
@@ -2649,11 +2830,7 @@ int whpx_vcpu_run(CPUState *cpu)
             } else if ((vcpu->exit_ctx.VpException.ExceptionType ==
                         WHvX64ExceptionTypeDebugTrapOrFault) &&
                        !cpu_single_stepping(cpu)) {
-                /*
-                 * Just finished stepping over a breakpoint, but the
-                 * gdb does not expect us to do single-stepping.
-                 * Don't do anything special.
-                 */
+                whpx_inject_back_db(cpu);
                 cpu->exception_index = EXCP_INTERRUPT;
             } else {
                 /* Another exception or debug event. Report it to GDB. */
@@ -3021,7 +3198,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
     WHV_PROCESSOR_FEATURES_BANKS processor_features;
     WHV_PROCESSOR_PERFMON_FEATURES perfmon_features;
 
-    UINT32 cpuidExitList[] = {0x0, 0x1, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
+    UINT32 cpuidExitList[] = {0x0, 0x1, 0x4, 0x6, 0x7, 0xb, 0xd, 0x14, 0x24, 0x29, 0x1E,
         0x40000000, 0x40000001, 0x40000010, 0x80000000, 0x80000001,
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
@@ -3247,6 +3424,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
 
     synthetic_features.Bank0.HypervisorPresent = 1;
     synthetic_features.Bank0.Hv1 = 1;
+    synthetic_features.Bank0.FastHypercallOutput = 1;
     synthetic_features.Bank0.AccessVpRunTimeReg = 1;
     synthetic_features.Bank0.AccessPartitionReferenceCounter = 1;
     synthetic_features.Bank0.AccessPartitionReferenceTsc = 1;

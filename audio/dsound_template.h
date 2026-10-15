@@ -181,6 +181,25 @@ static int dsound_init_out(HWVoiceOut *hw, struct audsettings *as)
     AudiodevPerDirectionOptions *pdo = hw->s->dev->u.dsound.out;
 #endif
 
+#ifdef DSBTYPE_IN
+    /* A playback-only VM must also work on a host without a microphone. */
+    if (!s->dsound_capture) {
+        hr = CoCreateInstance(&CLSID_DirectSoundCapture, NULL, CLSCTX_ALL,
+                              &IID_IDirectSoundCapture,
+                              (void **)&s->dsound_capture);
+        if (FAILED(hr)) {
+            dsound_logerr(hr, "Could not create DirectSoundCapture instance");
+            return -1;
+        }
+        hr = IDirectSoundCapture_Initialize(s->dsound_capture, NULL);
+        if (FAILED(hr)) {
+            dsound_logerr(hr, "Could not initialize DirectSoundCapture");
+            IDirectSoundCapture_Release(s->dsound_capture);
+            s->dsound_capture = NULL;
+            return -1;
+        }
+    }
+#endif
     if (!s->FIELD2) {
         error_report("dsound: Attempt to initialize voice without "
                      NAME2 " object");

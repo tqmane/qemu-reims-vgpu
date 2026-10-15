@@ -37,6 +37,9 @@ system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fb.c'))
 system_ss.add(when: 'CONFIG_VGA', if_true: files('vga.c'))
 system_ss.add(when: 'CONFIG_VIRTIO', if_true: files('virtio-dmabuf.c'))
 system_ss.add(when: 'CONFIG_DM163', if_true: files('dm163.c'))
+system_ss.add(when: 'CONFIG_VHOST_USER_MEDIA', if_true: files('vhost-user-media.c'))
+system_ss.add(when: ['CONFIG_VHOST_USER_MEDIA', 'CONFIG_VIRTIO_PCI'],
+  if_true: files('vhost-user-media-pci.c'))
 
 stub_ss.add([files('acpi-vga-stub.c'), pixman])
 if (config_all_devices.has_key('CONFIG_VGA_CIRRUS') or
@@ -62,8 +65,18 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
 
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
-system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
+# Only macOS naps an application; elsewhere apple-gfx's hold does nothing.
+if host_os == 'darwin'
+  apple_gfx_activity = [files('apple-gfx-activity.m'), foundation]
+else
+  apple_gfx_activity = files('apple-gfx-activity-stub.c')
+endif
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],
+              if_true: [files('apple-gfx.c', 'apple-gfx-pci.c'),
+                        apple_gfx_activity])
+system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],
+              if_true: [files('apple-gfx.c', 'apple-gfx-mmio.c'),
+                        apple_gfx_activity])
 
 if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   virtio_gpu_ss = ss.source_set()

@@ -39,6 +39,7 @@
 #include "qemu/timer.h"
 #include "qom/object.h"
 #include "hw/acpi/acpi_aml_interface.h"
+#include "qemu/bswap.h"
 
 /* #define DEBUG_SMC */
 
@@ -92,6 +93,7 @@ struct AppleSMCData {
     uint8_t len;
     const char *key;
     const char *data;
+    const char *type;
     QLIST_ENTRY(AppleSMCData) node;
 };
 
@@ -114,6 +116,7 @@ struct AppleSMCState {
     uint8_t data_pos;
     uint8_t data[255];
     char *osk;
+    uint8_t key_count[4];
     QLIST_HEAD(, AppleSMCData) data_def;
 };
 
@@ -126,6 +129,8 @@ static void applesmc_io_cmd_write(void *opaque, hwaddr addr, uint64_t val,
     smc_debug("CMD received: 0x%02x\n", (uint8_t)val);
     switch (val) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
         /* did last command run through OK? */
         if (status == APPLESMC_ST_CMD_DONE || status == APPLESMC_ST_NEW_CMD) {
             s->cmd = val;
@@ -166,17 +171,40 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
     smc_debug("DATA received: 0x%02x\n", (uint8_t)val);
     switch (s->cmd) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
         if ((s->status & 0x0f) == APPLESMC_ST_CMD_DONE) {
             break;
         }
         if (s->read_pos < 4) {
             s->key[s->read_pos] = val;
             s->status = APPLESMC_ST_ACK;
-        } else if (s->read_pos == 4) {
-            d = applesmc_find_key(s);
+        }
+        /* macOS omits the length byte for index and key-info commands. */
+        if (s->read_pos == (s->cmd == APPLESMC_READ_CMD ? 4 : 3)) {
+            if (s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD) {
+                uint32_t index = ldl_be_p(s->key);
+                QLIST_FOREACH(d, &s->data_def, node) {
+                    if (index-- == 0) {
+                        break;
+                    }
+                }
+            } else {
+                d = applesmc_find_key(s);
+            }
             if (d != NULL) {
-                memcpy(s->data, d->data, d->len);
-                s->data_len = d->len;
+                if (s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD) {
+                    memcpy(s->data, d->key, 4);
+                    s->data_len = 4;
+                } else if (s->cmd == APPLESMC_GET_KEY_TYPE_CMD) {
+                    s->data[0] = d->len;
+                    memcpy(s->data + 1, d->type, 4);
+                    s->data[5] = 0x80; /* readable, not writable */
+                    s->data_len = 6;
+                } else {
+                    memcpy(s->data, d->data, d->len);
+                    s->data_len = d->len;
+                }
                 s->data_pos = 0;
                 s->status = APPLESMC_ST_ACK | APPLESMC_ST_DATA_READY;
                 s->status_1e = APPLESMC_ST_CMD_DONE;  /* clear on valid key */
@@ -184,7 +212,8 @@ static void applesmc_io_data_write(void *opaque, hwaddr addr, uint64_t val,
                 smc_debug("READ_CMD: key '%c%c%c%c' not found!\n",
                           s->key[0], s->key[1], s->key[2], s->key[3]);
                 s->status = APPLESMC_ST_CMD_DONE;
-                s->status_1e = APPLESMC_ST_1E_NOEXIST;
+                s->status_1e = s->cmd == APPLESMC_GET_KEY_BY_INDEX_CMD ?
+                              APPLESMC_ST_1E_BAD_INDEX : APPLESMC_ST_1E_NOEXIST;
             }
         }
         s->read_pos++;
@@ -208,6 +237,8 @@ static uint64_t applesmc_io_data_read(void *opaque, hwaddr addr, unsigned size)
 
     switch (s->cmd) {
     case APPLESMC_READ_CMD:
+    case APPLESMC_GET_KEY_BY_INDEX_CMD:
+    case APPLESMC_GET_KEY_TYPE_CMD:
         if (!(s->status & APPLESMC_ST_DATA_READY)) {
             break;
         }
@@ -254,16 +285,28 @@ static uint64_t applesmc_io_err_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 static void applesmc_add_key(AppleSMCState *s, const char *key,
-                             int len, const char *data)
+                             int len, const char *data, const char *type)
 {
-    struct AppleSMCData *def;
+    struct AppleSMCData *def, *next, *previous = NULL;
 
     def = g_new0(struct AppleSMCData, 1);
     def->key = key;
     def->len = len;
     def->data = data;
+    def->type = type;
 
-    QLIST_INSERT_HEAD(&s->data_def, def, node);
+    QLIST_FOREACH(next, &s->data_def, node) {
+        if (memcmp(next->key, key, 4) > 0) {
+            QLIST_INSERT_BEFORE(next, def, node);
+            return;
+        }
+        previous = next;
+    }
+    if (previous) {
+        QLIST_INSERT_AFTER(previous, def, node);
+    } else {
+        QLIST_INSERT_HEAD(&s->data_def, def, node);
+    }
 }
 
 static void qdev_applesmc_isa_reset(DeviceState *dev)
@@ -273,6 +316,8 @@ static void qdev_applesmc_isa_reset(DeviceState *dev)
     s->status = 0x00;
     s->status_1e = 0x00;
     s->last_ret = 0x00;
+    s->cmd = 0;
+    s->read_pos = s->data_pos = s->data_len = 0;
 }
 
 static const MemoryRegionOps applesmc_data_io_ops = {
@@ -308,6 +353,8 @@ static const MemoryRegionOps applesmc_err_io_ops = {
 static void applesmc_isa_realize(DeviceState *dev, Error **errp)
 {
     AppleSMCState *s = APPLE_SMC(dev);
+    struct AppleSMCData *entry;
+    uint32_t count = 0;
 
     memory_region_init_io(&s->io_data, OBJECT(s), &applesmc_data_io_ops, s,
                           "applesmc-data", 1);
@@ -330,12 +377,17 @@ static void applesmc_isa_realize(DeviceState *dev, Error **errp)
     }
 
     QLIST_INIT(&s->data_def);
-    applesmc_add_key(s, "REV ", 6, "\x01\x13\x0f\x00\x00\x03");
-    applesmc_add_key(s, "OSK0", 32, s->osk);
-    applesmc_add_key(s, "OSK1", 32, s->osk + 32);
-    applesmc_add_key(s, "NATJ", 1, "\x00");
-    applesmc_add_key(s, "MSSP", 1, "\x00");
-    applesmc_add_key(s, "MSSD", 1, "\x03");
+    applesmc_add_key(s, "REV ", 6, "\x01\x13\x0f\x00\x00\x03", "{rev");
+    applesmc_add_key(s, "OSK0", 32, s->osk, "ch8*");
+    applesmc_add_key(s, "OSK1", 32, s->osk + 32, "ch8*");
+    applesmc_add_key(s, "NATJ", 1, "\x00", "ui8 ");
+    applesmc_add_key(s, "MSSP", 1, "\x00", "ui8 ");
+    applesmc_add_key(s, "MSSD", 1, "\x03", "si8 ");
+    applesmc_add_key(s, "#KEY", 4, (const char *)s->key_count, "ui32");
+    QLIST_FOREACH(entry, &s->data_def, node) {
+        count++;
+    }
+    stl_be_p(s->key_count, count);
 }
 
 static void applesmc_unrealize(DeviceState *dev)

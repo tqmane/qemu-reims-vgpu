@@ -40,6 +40,9 @@ struct RAMBlock {
     Error *cpr_blocker;
     int fd;
     uint64_t fd_offset;
+#ifdef _WIN32
+    HANDLE win32_section; /* Owns the section behind host, or NULL for prealloc. */
+#endif
     int guest_memfd;
     RamBlockAttributes *attributes;
     size_t page_size;
@@ -60,6 +63,12 @@ struct RAMBlock {
 
     /* Bitmap of already received pages.  Only used on destination side. */
     unsigned long *receivedmap;
+    /*
+     * Bitmap for pages that are yet to be read from disk. It is required for
+     * fault thread and eager thread to keep note of which pages are currently
+     * being read. Used by fast snapshot load.
+     */
+    unsigned long *pending_bmap;
 
     /*
      * bitmap to track already cleared dirty bitmap.  When the bit is
