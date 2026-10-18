@@ -605,6 +605,69 @@ static const MemoryRegionOps apple_gfx_ops = {
 
 /* ------ Initialisation and startup ------ */
 
+static void apple_gfx_get_hide_host_cursor(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool hidden = s->hide_host_cursor;
+
+    visit_type_bool(v, name, &hidden, errp);
+}
+
+static void apple_gfx_set_hide_host_cursor(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool hidden;
+    RvgStatus status;
+    uint32_t i;
+
+    if (!visit_type_bool(v, name, &hidden, errp)) {
+        return;
+    }
+    if (!qdev_is_realized(DEVICE(obj))) {
+        s->hide_host_cursor = hidden;
+        return;
+    }
+    if (!s->window || !s->pgdev) {
+        error_setg(errp, "apple-gfx: hide-host-cursor requires an owned "
+                   "Reims native window (-display none)");
+        return;
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        if (!s->displays[i].pgdisp) {
+            error_setg(errp, "apple-gfx: display %u is unavailable", i);
+            return;
+        }
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        status = rvg_display_set_host_cursor_hidden(s->displays[i].pgdisp,
+                                                    hidden);
+        if (status != RVG_OK) {
+            Error *failure = NULL;
+
+            error_setg(&failure, "apple-gfx: display %u: "
+                       "rvg_display_set_host_cursor_hidden: %s", i,
+                       rvg_status_message(status));
+            while (i-- > 0) {
+                status = rvg_display_set_host_cursor_hidden(
+                    s->displays[i].pgdisp, s->hide_host_cursor);
+                if (status != RVG_OK) {
+                    error_append_hint(&failure,
+                        "Display %u cursor policy rollback failed: %s\n",
+                        i, rvg_status_message(status));
+                }
+            }
+            error_propagate(errp, failure);
+            return;
+        }
+    }
+    /* Every display accepted the queued UI update; no GPU work is awaited. */
+    s->hide_host_cursor = hidden;
+}
+
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
 {
     trace_apple_gfx_common_init(obj_name, RVG_DEVICE_MMIO_SIZE);
@@ -619,6 +682,14 @@ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
      * (cputlb.c), so under them the accesses stay one at a time.
      */
     memory_region_enable_lockless_io(&s->iomem_gfx);
+
+    /* Unlike a generic qdev bool property, this remains writable realized. */
+    object_property_add(obj, "hide-host-cursor", "bool",
+                        apple_gfx_get_hide_host_cursor,
+                        apple_gfx_set_hide_host_cursor, NULL, s);
+    object_property_set_description(obj, "hide-host-cursor",
+        "Hide the host cursor in owned Reims native windows; guest cursor "
+        "visibility is unchanged");
 
     /*
      * TODO: reims-vgpu can suspend and resume the device
@@ -1084,6 +1155,15 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                                     errp)) {
         return false;
     }
+    s->window = apple_gfx_window_wanted();
+    if (s->hide_host_cursor && !s->window) {
+        error_setg(errp, "apple-gfx: hide-host-cursor requires an owned "
+                   "Reims native window (-display none)");
+        return false;
+    }
+    if (s->hide_host_cursor) {
+        window_config.flags |= RVG_WINDOW_HIDE_HOST_CURSOR;
+    }
 
     if (apple_gfx_mig_blocker == NULL) {
         error_setg(&apple_gfx_mig_blocker,
@@ -1123,7 +1203,6 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
     s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
-    s->window = apple_gfx_window_wanted();
     for (i = 0; i < s->num_displays; i++) {
         s->displays[i].state = s;
         s->displays[i].cursor_show = true;
@@ -1163,6 +1242,15 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
             error_setg(errp, "apple-gfx: rvg_display_create: %s",
                        rvg_status_message(status));
             goto fail;
+        }
+        if (s->hide_host_cursor) {
+            status = rvg_display_set_host_cursor_hidden(d->pgdisp, true);
+            if (status != RVG_OK) {
+                error_setg(errp, "apple-gfx: display %u: "
+                           "rvg_display_set_host_cursor_hidden: %s", i,
+                           rvg_status_message(status));
+                goto fail;
+            }
         }
 
         /* A window offers its own modes, unless display-modes names some. */

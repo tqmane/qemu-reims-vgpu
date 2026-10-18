@@ -78,6 +78,8 @@ struct AppleGFXState {
      * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).
      */
     bool window;
+    /* Host-window policy, independent of the guest's cursor_show state. */
+    bool hide_host_cursor;
     /* Realize began a hold on the activity against App Nap. */
     bool holds_activity;
     AppleGFXDisplay displays[RVG_MAX_DISPLAY_PORTS];
