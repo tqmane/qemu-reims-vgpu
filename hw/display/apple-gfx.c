@@ -649,8 +649,10 @@ static void apple_gfx_set_hide_host_cursor(Object *obj, Visitor *v,
             Error *failure = NULL;
 
             error_setg(&failure, "apple-gfx: display %u: "
-                       "rvg_display_set_host_cursor_hidden: %s", i,
-                       rvg_status_message(status));
+                       "rvg_display_set_host_cursor_hidden: %s "
+                       "(hide-host-cursor requires a live Reims-owned "
+                       "native window on a supported Windows/Linux host)",
+                       i, rvg_status_message(status));
             while (i-- > 0) {
                 status = rvg_display_set_host_cursor_hidden(
                     s->displays[i].pgdisp, s->hide_host_cursor);
@@ -1247,8 +1249,10 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
             status = rvg_display_set_host_cursor_hidden(d->pgdisp, true);
             if (status != RVG_OK) {
                 error_setg(errp, "apple-gfx: display %u: "
-                           "rvg_display_set_host_cursor_hidden: %s", i,
-                           rvg_status_message(status));
+                           "rvg_display_set_host_cursor_hidden: %s "
+                           "(hide-host-cursor requires a live Reims-owned "
+                           "native window on a supported Windows/Linux host)",
+                           i, rvg_status_message(status));
                 goto fail;
             }
         }
