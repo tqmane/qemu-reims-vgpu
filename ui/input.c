@@ -488,6 +488,18 @@ bool qemu_input_is_absolute(const QemuConsole *con)
     return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_ABS);
 }
 
+bool qemu_input_pointer_route_is_coherent(const QemuConsole *con, int index,
+                                         bool absolute)
+{
+    uint32_t motion = absolute ? INPUT_EVENT_MASK_ABS : INPUT_EVENT_MASK_REL;
+    QemuInputHandlerState *s = qemu_input_find_handler(motion, con);
+
+    return s && s->id == index &&
+           (s->handler->mask & (motion | INPUT_EVENT_MASK_BTN)) ==
+           (motion | INPUT_EVENT_MASK_BTN) &&
+           qemu_input_find_handler(INPUT_EVENT_MASK_BTN, con) == s;
+}
+
 /*
  * Whether the device that takes wheel and scroll input from @con takes
  * scroll events; if not, a user interface sends it wheel buttons.

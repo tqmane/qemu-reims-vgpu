@@ -76,6 +76,9 @@ void qemu_input_update_buttons(QemuConsole *src, uint32_t *button_map,
                                uint32_t button_old, uint32_t button_new);
 
 bool qemu_input_is_absolute(const QemuConsole *con);
+/* Motion and buttons must both reach the selected pointer handler. */
+bool qemu_input_pointer_route_is_coherent(const QemuConsole *con, int index,
+                                         bool absolute);
 bool qemu_input_scrolls_smoothly(const QemuConsole *con);
 int qemu_input_scale_axis(int value,
                           int min_in, int max_in,

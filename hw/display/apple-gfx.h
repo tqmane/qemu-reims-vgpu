@@ -78,6 +78,9 @@ struct AppleGFXState {
      * and sends its input (-display none, unless REIMS_VGPU_WINDOW=0).
      */
     bool window;
+    /* Host-window policy, independent of the guest's cursor_show state. */
+    bool hide_host_cursor;
+    bool relative_mouse;
     /* Realize began a hold on the activity against App Nap. */
     bool holds_activity;
     AppleGFXDisplay displays[RVG_MAX_DISPLAY_PORTS];
@@ -92,6 +95,12 @@ struct AppleGFXState {
 
     /* Mutable state (BQL protected) */
     uint32_t input_buttons; /* RVG_WINDOW_BUTTON_* bits the guest was sent */
+    uint32_t relative_input_buttons;
+    /* Keep routing old-kind releases after a relative-mode request changes. */
+    bool pointer_kind_routing;
+    /* ABS then REL; no handler pointer survives the BQL. */
+    int pointer_index[2];
+    bool pointer_route_error[2];
 };
 
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name);

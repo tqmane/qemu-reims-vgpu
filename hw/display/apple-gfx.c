@@ -326,26 +326,130 @@ static void set_cursor_glyph(AppleGFXDisplay *d,
 /* The most wheel notches one scroll event sends the guest, on each axis. */
 #define APPLE_GFX_WHEEL_MAX_NOTCHES 256
 
+static uint32_t apple_gfx_button_map[INPUT_BUTTON__MAX] = {
+    [INPUT_BUTTON_LEFT] = RVG_WINDOW_BUTTON_LEFT,
+    [INPUT_BUTTON_RIGHT] = RVG_WINDOW_BUTTON_RIGHT,
+    [INPUT_BUTTON_MIDDLE] = RVG_WINDOW_BUTTON_MIDDLE,
+    [INPUT_BUTTON_SIDE] = RVG_WINDOW_BUTTON_SIDE,
+    [INPUT_BUTTON_EXTRA] = RVG_WINDOW_BUTTON_EXTRA,
+};
+
+/* Select by actual registered HID name/type, never a presumed mouse index. */
+static bool apple_gfx_pointer_route(const QemuConsole *con, bool relative,
+                                    bool check_only, int *selected,
+                                    Error **errp)
+{
+    const char *name = relative ? "QEMU HID Mouse" : "QEMU HID Tablet";
+    MouseInfoList *mice = qmp_query_mice(errp), *entry;
+    int previous = -1, index = -1, count = 0;
+    bool coherent;
+
+    for (entry = mice; entry; entry = entry->next) {
+        if (entry->value->current) {
+            previous = entry->value->index;
+        }
+        if (!strcmp(entry->value->name, name) &&
+            entry->value->absolute == !relative) {
+            index = entry->value->index;
+            count++;
+        }
+    }
+    qapi_free_MouseInfoList(mice);
+    if (count != 1 || previous < 0) {
+        error_setg(errp, "apple-gfx: relative-mouse requires exactly one %s; "
+                   "create usb-mouse and usb-tablet before apple-gfx", name);
+        return false;
+    }
+    if (previous != index && !qemu_mouse_set(index, errp)) {
+        return false;
+    }
+    coherent = qemu_input_pointer_route_is_coherent(con, index, !relative);
+    if (!coherent) {
+        error_setg(errp, "apple-gfx: %s motion and buttons do not route "
+                   "together to the selected HID device", name);
+    }
+    if ((check_only || !coherent) && previous != index) {
+        Error *restore = NULL;
+
+        if (!qemu_mouse_set(previous, &restore)) {
+            if (coherent) {
+                error_setg(errp, "apple-gfx: pointer selection restore failed");
+            }
+            error_append_hint(errp, "%s\n", error_get_pretty(restore));
+            error_free(restore);
+            coherent = false;
+        }
+    }
+    if (coherent && selected) {
+        *selected = index;
+    }
+    return coherent;
+}
+
+static bool apple_gfx_pointer_packet(AppleGFXDisplay *d, bool relative)
+{
+    AppleGFXState *s = d->state;
+    Error *err = NULL;
+    int index;
+
+    if (!apple_gfx_pointer_route(d->con, relative, false, &index, &err)) {
+        if (!s->pointer_route_error[relative]) {
+            error_report_err(err);
+        } else {
+            error_free(err);
+        }
+        s->pointer_route_error[relative] = true;
+        return false;
+    }
+    s->pointer_route_error[relative] = false;
+    if (s->pointer_index[relative] >= 0 &&
+        s->pointer_index[relative] != index) {
+        /* A replacement HID device starts with all buttons released. */
+        if (relative) {
+            s->relative_input_buttons = 0;
+        } else {
+            s->input_buttons = 0;
+        }
+    }
+    s->pointer_index[relative] = index;
+    return true;
+}
+
 static void apple_gfx_input_pointer(AppleGFXDisplay *d, uint16_t x,
                                     uint16_t y, uint16_t width,
                                     uint16_t height, uint32_t buttons)
 {
-    static uint32_t button_map[INPUT_BUTTON__MAX] = {
-        [INPUT_BUTTON_LEFT] = RVG_WINDOW_BUTTON_LEFT,
-        [INPUT_BUTTON_RIGHT] = RVG_WINDOW_BUTTON_RIGHT,
-        [INPUT_BUTTON_MIDDLE] = RVG_WINDOW_BUTTON_MIDDLE,
-        [INPUT_BUTTON_SIDE] = RVG_WINDOW_BUTTON_SIDE,
-        [INPUT_BUTTON_EXTRA] = RVG_WINDOW_BUTTON_EXTRA,
-    };
     AppleGFXState *s = d->state;
 
+    if (s->pointer_kind_routing && !apple_gfx_pointer_packet(d, false)) {
+        return;
+    }
     /* QEMU's input layer does not clamp absolute axes. */
     width = MAX(width, 1);
     height = MAX(height, 1);
     qemu_input_queue_abs(d->con, INPUT_AXIS_X, MIN(x, width - 1), 0, width);
     qemu_input_queue_abs(d->con, INPUT_AXIS_Y, MIN(y, height - 1), 0, height);
-    qemu_input_update_buttons(d->con, button_map, s->input_buttons, buttons);
+    qemu_input_update_buttons(d->con, apple_gfx_button_map,
+                              s->input_buttons, buttons);
     s->input_buttons = buttons;
+    qemu_input_event_sync();
+}
+
+static void apple_gfx_input_pointer_relative(AppleGFXDisplay *d, int32_t dx,
+                                             int32_t dy, uint32_t buttons)
+{
+    AppleGFXState *s = d->state;
+
+    /* Callback kind, not the requested mode, identifies deferred releases. */
+    s->pointer_kind_routing = true;
+    if (!apple_gfx_pointer_packet(d, true)) {
+        return;
+    }
+    qemu_input_queue_rel(d->con, INPUT_AXIS_X, dx);
+    qemu_input_queue_rel(d->con, INPUT_AXIS_Y, dy);
+    qemu_input_update_buttons(d->con, apple_gfx_button_map,
+                              s->relative_input_buttons, buttons);
+    s->relative_input_buttons = buttons;
     qemu_input_event_sync();
 }
 
@@ -449,6 +553,7 @@ typedef enum AppleGFXEventKind {
     APPLE_GFX_EVENT_CURSOR_SHOW,
     APPLE_GFX_EVENT_CURSOR_MOVE,
     APPLE_GFX_EVENT_POINTER,
+    APPLE_GFX_EVENT_POINTER_RELATIVE,
     APPLE_GFX_EVENT_SCROLL,
     APPLE_GFX_EVENT_KEY,
     APPLE_GFX_EVENT_CLOSE,
@@ -468,6 +573,11 @@ struct AppleGFXEvent {
             uint16_t height;
             uint32_t buttons;
         } pointer;
+        struct {
+            int32_t dx;
+            int32_t dy;
+            uint32_t buttons;
+        } pointer_relative;
         RvgWindowScroll scroll;
         struct {
             uint16_t usage;
@@ -521,6 +631,11 @@ static void apple_gfx_event_run(AppleGFXEvent *event)
         apple_gfx_input_pointer(d, event->pointer.x, event->pointer.y,
                                 event->pointer.width, event->pointer.height,
                                 event->pointer.buttons);
+        break;
+    case APPLE_GFX_EVENT_POINTER_RELATIVE:
+        apple_gfx_input_pointer_relative(d, event->pointer_relative.dx,
+                                         event->pointer_relative.dy,
+                                         event->pointer_relative.buttons);
         break;
     case APPLE_GFX_EVENT_SCROLL:
         apple_gfx_input_scroll(d, &event->scroll);
@@ -605,6 +720,145 @@ static const MemoryRegionOps apple_gfx_ops = {
 
 /* ------ Initialisation and startup ------ */
 
+static void apple_gfx_get_hide_host_cursor(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool hidden = s->hide_host_cursor;
+
+    visit_type_bool(v, name, &hidden, errp);
+}
+
+static void apple_gfx_set_hide_host_cursor(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool hidden;
+    RvgStatus status;
+    uint32_t i;
+
+    if (!visit_type_bool(v, name, &hidden, errp)) {
+        return;
+    }
+    if (!qdev_is_realized(DEVICE(obj))) {
+        s->hide_host_cursor = hidden;
+        return;
+    }
+    if (!s->window || !s->pgdev) {
+        error_setg(errp, "apple-gfx: hide-host-cursor requires an owned "
+                   "Reims native window (-display none)");
+        return;
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        if (!s->displays[i].pgdisp) {
+            error_setg(errp, "apple-gfx: display %u is unavailable", i);
+            return;
+        }
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        status = rvg_display_set_host_cursor_hidden(s->displays[i].pgdisp,
+                                                    hidden);
+        if (status != RVG_OK) {
+            Error *failure = NULL;
+
+            error_setg(&failure, "apple-gfx: display %u: "
+                       "rvg_display_set_host_cursor_hidden: %s "
+                       "(hide-host-cursor requires a live Reims-owned "
+                       "native window on a supported Windows/Linux host)",
+                       i, rvg_status_message(status));
+            while (i-- > 0) {
+                status = rvg_display_set_host_cursor_hidden(
+                    s->displays[i].pgdisp, s->hide_host_cursor);
+                if (status != RVG_OK) {
+                    error_append_hint(&failure,
+                        "Display %u cursor policy rollback failed: %s\n",
+                        i, rvg_status_message(status));
+                }
+            }
+            error_propagate(errp, failure);
+            return;
+        }
+    }
+    /* Every display accepted the queued UI update; no GPU work is awaited. */
+    s->hide_host_cursor = hidden;
+}
+
+static void apple_gfx_get_relative_mouse(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool enabled = s->relative_mouse;
+
+    visit_type_bool(v, name, &enabled, errp);
+}
+
+static void apple_gfx_set_relative_mouse(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    AppleGFXState *s = opaque;
+    bool enabled;
+    RvgStatus status;
+    uint32_t i;
+
+    if (!visit_type_bool(v, name, &enabled, errp)) {
+        return;
+    }
+    if (!qdev_is_realized(DEVICE(obj))) {
+        s->relative_mouse = enabled;
+        return;
+    }
+    if (!s->window || !s->pgdev) {
+        error_setg(errp, "apple-gfx: relative-mouse requires a live owned "
+                   "Reims native window on a supported Windows/Linux host");
+        return;
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        AppleGFXDisplay *d = &s->displays[i];
+
+        if (!d->pgdisp) {
+            error_setg(errp, "apple-gfx: display %u is unavailable", i);
+            return;
+        }
+        if (enabled &&
+            (!apple_gfx_pointer_route(d->con, false, true, NULL, errp) ||
+             !apple_gfx_pointer_route(d->con, true, true, NULL, errp))) {
+            return;
+        }
+    }
+    if (enabled) {
+        /* Queued old-kind releases remain routable even on partial refusal. */
+        s->pointer_kind_routing = true;
+    }
+    for (i = 0; i < s->num_displays; i++) {
+        status = rvg_display_set_relative_mouse_mode(s->displays[i].pgdisp,
+                                                      enabled);
+        if (status != RVG_OK) {
+            Error *failure = NULL;
+
+            error_setg(&failure, "apple-gfx: display %u: "
+                       "rvg_display_set_relative_mouse_mode: %s "
+                       "(requires a live owned Windows/Linux SDL window)",
+                       i, rvg_status_message(status));
+            while (i-- > 0) {
+                status = rvg_display_set_relative_mouse_mode(
+                    s->displays[i].pgdisp, s->relative_mouse);
+                if (status != RVG_OK) {
+                    error_append_hint(&failure,
+                        "Display %u relative-mouse rollback failed: %s\n",
+                        i, rvg_status_message(status));
+                }
+            }
+            error_propagate(errp, failure);
+            return;
+        }
+    }
+    s->relative_mouse = enabled;
+}
+
 void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
 {
     trace_apple_gfx_common_init(obj_name, RVG_DEVICE_MMIO_SIZE);
@@ -619,6 +873,21 @@ void apple_gfx_common_init(Object *obj, AppleGFXState *s, const char *obj_name)
      * (cputlb.c), so under them the accesses stay one at a time.
      */
     memory_region_enable_lockless_io(&s->iomem_gfx);
+
+    /* Unlike a generic qdev bool property, this remains writable realized. */
+    object_property_add(obj, "hide-host-cursor", "bool",
+                        apple_gfx_get_hide_host_cursor,
+                        apple_gfx_set_hide_host_cursor, NULL, s);
+    object_property_set_description(obj, "hide-host-cursor",
+        "Hide the host cursor in owned Reims native windows; guest cursor "
+        "visibility is unchanged");
+    object_property_add(obj, "relative-mouse", "bool",
+                        apple_gfx_get_relative_mouse,
+                        apple_gfx_set_relative_mouse, NULL, s);
+    object_property_set_description(obj, "relative-mouse",
+        "Relative input in captured owned Reims native windows; requires "
+        "usb-mouse and usb-tablet before apple-gfx");
+    s->pointer_index[0] = s->pointer_index[1] = -1;
 
     /*
      * TODO: reims-vgpu can suspend and resume the device
@@ -843,6 +1112,18 @@ static void apple_gfx_window_pointer_cb(void *ctx, uint16_t x, uint16_t y,
     apple_gfx_event_push(event);
 }
 
+static void apple_gfx_window_pointer_relative_cb(void *ctx, int32_t dx,
+                                                 int32_t dy, uint32_t buttons)
+{
+    AppleGFXEvent *event =
+        apple_gfx_event_new(ctx, APPLE_GFX_EVENT_POINTER_RELATIVE);
+
+    event->pointer_relative.dx = dx;
+    event->pointer_relative.dy = dy;
+    event->pointer_relative.buttons = buttons;
+    apple_gfx_event_push(event);
+}
+
 static void apple_gfx_window_scroll_cb(void *ctx,
                                        const RvgWindowScroll *scroll)
 {
@@ -1051,6 +1332,7 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         .key = apple_gfx_window_key_cb,
         .close = apple_gfx_window_close_cb,
         .scroll = apple_gfx_window_scroll_cb,
+        .pointer_relative = apple_gfx_window_pointer_relative_cb,
     };
     /*
      * Unless display-modes names some, the library offers the resolution
@@ -1083,6 +1365,28 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                                     &window_config.mode_pixels_per_inch,
                                     errp)) {
         return false;
+    }
+    s->window = apple_gfx_window_wanted();
+    if (s->hide_host_cursor && !s->window) {
+        error_setg(errp, "apple-gfx: hide-host-cursor requires an owned "
+                   "Reims native window (-display none)");
+        return false;
+    }
+    if (s->hide_host_cursor) {
+        window_config.flags |= RVG_WINDOW_HIDE_HOST_CURSOR;
+    }
+    if (s->relative_mouse) {
+        if (!s->window) {
+            error_setg(errp, "apple-gfx: relative-mouse requires an owned "
+                       "Reims native window (-display none)");
+            return false;
+        }
+        if (!apple_gfx_pointer_route(NULL, false, true, NULL, errp) ||
+            !apple_gfx_pointer_route(NULL, true, true, NULL, errp)) {
+            return false;
+        }
+        window_config.flags |= RVG_WINDOW_RELATIVE_MOUSE;
+        s->pointer_kind_routing = true;
     }
 
     if (apple_gfx_mig_blocker == NULL) {
@@ -1123,7 +1427,6 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
     qemu_mutex_init(&s->event_lock);
     QSIMPLEQ_INIT(&s->events);
     s->event_bh = qemu_bh_new(apple_gfx_event_bh, s);
-    s->window = apple_gfx_window_wanted();
     for (i = 0; i < s->num_displays; i++) {
         s->displays[i].state = s;
         s->displays[i].cursor_show = true;
@@ -1162,7 +1465,32 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
         if (status != RVG_OK) {
             error_setg(errp, "apple-gfx: rvg_display_create: %s",
                        rvg_status_message(status));
+            if (s->relative_mouse) {
+                error_append_hint(errp, "relative-mouse requires a supported "
+                                  "Windows/Linux SDL window and callback.\n");
+            }
             goto fail;
+        }
+        if (s->hide_host_cursor) {
+            status = rvg_display_set_host_cursor_hidden(d->pgdisp, true);
+            if (status != RVG_OK) {
+                error_setg(errp, "apple-gfx: display %u: "
+                           "rvg_display_set_host_cursor_hidden: %s "
+                           "(hide-host-cursor requires a live Reims-owned "
+                           "native window on a supported Windows/Linux host)",
+                           i, rvg_status_message(status));
+                goto fail;
+            }
+        }
+        if (s->relative_mouse) {
+            status = rvg_display_set_relative_mouse_mode(d->pgdisp, true);
+            if (status != RVG_OK) {
+                error_setg(errp, "apple-gfx: display %u: "
+                           "rvg_display_set_relative_mouse_mode: %s "
+                           "(requires a live owned Windows/Linux SDL window)",
+                           i, rvg_status_message(status));
+                goto fail;
+            }
         }
 
         /* A window offers its own modes, unless display-modes names some. */
