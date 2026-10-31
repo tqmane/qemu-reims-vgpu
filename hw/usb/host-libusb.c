@@ -39,6 +39,9 @@
 #include <poll.h>
 #endif
 #include <libusb.h>
+#ifdef CONFIG_WIN32
+#include "host-instance-id.h"
+#endif
 
 #ifdef CONFIG_LINUX
 #include <sys/ioctl.h>
@@ -86,6 +89,10 @@ struct USBHostDevice {
     /* properties */
     struct USBAutoFilter             match;
     char                             *hostdevice;
+#ifdef CONFIG_WIN32
+    char                             *host_instance_id;
+    USBHostInstanceIdRead             instance_id_read;
+#endif
     int32_t                          bootindex;
     uint32_t                         iso_urb_count;
     uint32_t                         iso_urb_frames;
@@ -958,6 +965,20 @@ static void usb_host_ep_update(USBHostDevice *s)
     libusb_free_config_descriptor(conf);
 }
 
+#ifdef CONFIG_WIN32
+static int usb_host_check_instance_id(USBHostDevice *s, libusb_device *dev)
+{
+    int rc = usb_host_instance_id_match(dev, s->host_instance_id,
+                                      s->instance_id_read);
+
+    if (rc != 0 && rc != LIBUSB_ERROR_NOT_FOUND) {
+        warn_report_once("usb-host instance ID lookup refused: %s",
+                         libusb_strerror(rc));
+    }
+    return rc;
+}
+#endif
+
 static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
 {
     USBDevice *udev = USB_DEVICE(s);
@@ -973,6 +994,11 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev, int hostfd)
     if (s->dh != NULL) {
         goto fail;
     }
+#ifdef CONFIG_WIN32
+    if (usb_host_check_instance_id(s, dev) != 0) {
+        return -1;
+    }
+#endif
 
     if (dev) {
         bus_num = libusb_get_bus_number(dev);
@@ -1197,6 +1223,27 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
     libusb_device *ldev;
     int rc;
 
+#ifdef CONFIG_WIN32
+    if (s->host_instance_id) {
+        if (!usb_host_instance_id_valid(s->host_instance_id)) {
+            error_setg(errp, "host-instance-id must be an exact "
+                       "PnP instance ID");
+            return;
+        }
+        if (s->hostdevice) {
+            error_setg(errp, "host-instance-id cannot be used with hostdevice");
+            return;
+        }
+        s->instance_id_read =
+            usb_host_instance_id_resolve(libusb_get_version());
+        if (!s->instance_id_read) {
+            error_setg(errp, "host-instance-id requires the Reims libusb "
+                       "instance-ID extension; update the engine");
+            return;
+        }
+    }
+#endif
+
     if (usb_host_init() != 0) {
         error_setg(errp, "failed to init libusb");
         return;
@@ -1246,6 +1293,15 @@ static void usb_host_realize(USBDevice *udev, Error **errp)
                        s->match.bus_num, s->match.addr);
             return;
         }
+#ifdef CONFIG_WIN32
+        rc = usb_host_check_instance_id(s, ldev);
+        if (rc != 0) {
+            libusb_unref_device(ldev);
+            error_setg(errp, "host-instance-id refused the selected device: %s",
+                       libusb_strerror(rc));
+            return;
+        }
+#endif
         rc = usb_host_open(s, ldev, 0);
         libusb_unref_device(ldev);
         if (rc < 0) {
@@ -1770,6 +1826,9 @@ static const Property usb_host_dev_properties[] = {
     DEFINE_PROP_UINT32("hostbus",  USBHostDevice, match.bus_num,    0),
     DEFINE_PROP_UINT32("hostaddr", USBHostDevice, match.addr,       0),
     DEFINE_PROP_STRING("hostport", USBHostDevice, match.port),
+#ifdef CONFIG_WIN32
+    DEFINE_PROP_STRING("host-instance-id", USBHostDevice, host_instance_id),
+#endif
     DEFINE_PROP_UINT32("vendorid",  USBHostDevice, match.vendor_id,  0),
     DEFINE_PROP_UINT32("productid", USBHostDevice, match.product_id, 0),
 #if LIBUSB_API_VERSION >= 0x01000107
@@ -1888,6 +1947,11 @@ static void usb_host_auto_check(void *unused)
                     continue;
                 }
 
+#ifdef CONFIG_WIN32
+                if (usb_host_check_instance_id(s, devs[i]) != 0) {
+                    continue;
+                }
+#endif
                 /* We got a match */
                 s->seen++;
                 if (s->errcount >= 3) {
