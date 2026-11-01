@@ -1512,6 +1512,7 @@ err:
 static void xhci_xfer_report(XHCITransfer *xfer)
 {
     uint32_t edtla = 0;
+    uint32_t short_residual = 0;
     unsigned int left;
     bool reported = 0;
     bool shortpkt = 0;
@@ -1539,6 +1540,9 @@ static void xhci_xfer_report(XHCITransfer *xfer)
             if (chunk > left) {
                 chunk = left;
                 if (xfer->status == CC_SUCCESS) {
+                    if (!shortpkt) {
+                        short_residual = (trb->status & 0x1ffff) - chunk;
+                    }
                     shortpkt = 1;
                 }
             }
@@ -1551,12 +1555,17 @@ static void xhci_xfer_report(XHCITransfer *xfer)
             break;
         }
 
-        if (!reported && ((trb->control & TRB_TR_IOC) ||
-                          (shortpkt && (trb->control & TRB_TR_ISP)) ||
-                          (xfer->status != CC_SUCCESS && left == 0))) {
+        if ((trb->control & TRB_TR_IOC) ||
+            (!reported && ((shortpkt && (trb->control & TRB_TR_ISP)) ||
+                           (xfer->status != CC_SUCCESS && left == 0)))) {
             event.slotid = xfer->epctx->slotid;
             event.epid = xfer->epctx->epid;
-            event.length = (trb->status & 0x1ffff) - chunk;
+            /*
+             * Later IOC events retain the first short TRB's residue
+             * (xHCI 4.10.1.1).
+             */
+            event.length = shortpkt ? short_residual :
+                                     (trb->status & 0x1ffff) - chunk;
             event.flags = 0;
             event.ptr = trb->addr;
             if (xfer->status == CC_SUCCESS) {
