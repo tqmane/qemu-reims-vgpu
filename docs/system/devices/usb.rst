@@ -329,6 +329,13 @@ the following properties:
   Specifies the device address the device got assigned by the guest os
 ``hostport=<str>``
   Specifies the physical port the device is attached to
+``host-instance-id=<str>`` (Windows)
+  Requires the exact, case-sensitive UTF-8 PnP instance ID in addition to any
+  other filters. Requires Reims libusb's Windows instance-ID extension and the
+  native Windows backend (not UsbDk). Missing or unreadable identity never
+  falls back to a port match. Cannot be combined with ``hostdevice``.
+  Re-enumeration under a different instance ID requires explicitly replacing
+  this property; it does not authorize another device on the same port.
 ``vendorid=<hexnr>``
   Specifies the vendor ID of the device
 ``productid=<hexnr>``

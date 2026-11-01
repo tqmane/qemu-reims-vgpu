@@ -64,6 +64,9 @@ endif
 
 if host_os == 'windows'
   tests += {'test-win32-ram': []}
+  if libusb.found()
+    tests += {'test-usb-host-instance-id': [libusb]}
+  endif
   test('test-symlink-install-tree', python,
        args: files('test-symlink-install-tree.py'), suite: 'unit')
 endif
